@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <title>程式碼編輯器</title>
+  <link rel="stylesheet" href="tooldock://sdk/ui-base.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <aside id="side">
+    <div id="projBar">
+      <select id="projSel" title="切換專案"></select>
+      <button class="ib" id="addProjBtn" title="建立專案（選擇資料夾）">＋</button>
+      <div class="menu-wrap">
+        <button class="ib" id="projMenuBtn" title="專案選項">⋯</button>
+        <div class="menu right" id="projMenu" hidden>
+          <button class="item" data-act="addProject">＋ 建立專案…</button>
+          <button class="item" data-act="renameProject">重新命名專案…</button>
+          <button class="item" data-act="revealProject">在檔案管理員中顯示</button>
+          <button class="item" data-act="removeProject">從清單移除專案</button>
+          <div class="sep"></div>
+          <button class="item" data-act="newFile">新增未命名檔案<span class="k" data-key="N"></span></button>
+          <button class="item" data-act="openFile">開啟檔案…<span class="k" data-key="O"></span></button>
+          <div id="recentBox"></div>
+        </div>
+      </div>
+    </div>
+    <div id="sideTabs">
+      <button data-side="files" class="on">檔案</button>
+      <button data-side="git">變更 <span class="badge" id="gitCount" hidden>0</span></button>
+    </div>
+
+    <section id="filesPane" class="pane">
+      <div class="sbar">
+        <input id="filter" type="search" placeholder="搜尋檔名（⌘P）" spellcheck="false" autocomplete="off">
+        <button class="ib sm" data-act="newFileIn" title="新增檔案">📄</button>
+        <button class="ib sm" data-act="newFolderIn" title="新增資料夾">📁</button>
+        <button class="ib sm" data-act="refresh" title="重新整理">⟳</button>
+        <button class="ib sm" data-act="collapse" title="全部收合">⊟</button>
+      </div>
+      <div id="tree" class="list" tabindex="0"></div>
+    </section>
+
+    <section id="gitPane" class="pane" hidden>
+      <div id="gitHead"></div>
+      <div id="changes" class="list" tabindex="0"></div>
+    </section>
+  </aside>
+  <div id="sideSplit" title="拖曳調整寬度"></div>
+
+  <main id="main">
+    <div id="tabs"></div>
+    <div id="banner" hidden><span class="msg"></span><span class="acts"></span></div>
+    <div id="findBar" hidden>
+      <div class="frow">
+        <input id="findInput" placeholder="尋找" spellcheck="false" autocomplete="off">
+        <button class="ib sm tog" id="findCase" title="大小寫須相符">Aa</button>
+        <button class="ib sm tog" id="findRegex" title="規則運算式">.*</button>
+        <span id="findCount"></span>
+        <button class="ib sm" id="findPrev" title="上一個（⇧Enter）">↑</button>
+        <button class="ib sm" id="findNext" title="下一個（Enter）">↓</button>
+        <button class="ib sm" id="findClose" title="關閉（Esc）">✕</button>
+      </div>
+      <div class="frow">
+        <input id="replaceInput" placeholder="取代為" spellcheck="false" autocomplete="off">
+        <button class="secondary sm" id="replaceOne">取代</button>
+        <button class="secondary sm" id="replaceAll">全部取代</button>
+      </div>
+    </div>
+    <div id="stage">
+      <div id="welcome">
+        <div class="hero">💻</div>
+        <h2>程式碼編輯器</h2>
+        <p>建立專案後，可以在左側瀏覽資料夾、開啟檔案，並在「變更」查看 Git 異動與差異比對。</p>
+        <div class="acts">
+          <button id="welcomeAdd">＋ 建立專案…</button>
+          <button class="secondary" id="welcomeOpen">開啟檔案…</button>
+        </div>
+        <table class="keys">
+          <tr><td>⌘P</td><td>搜尋檔名</td><td>⌘S</td><td>儲存</td></tr>
+          <tr><td>⌘F</td><td>尋找／取代</td><td>⌃G</td><td>前往行</td></tr>
+          <tr><td>⌘/</td><td>切換註解</td><td>⇥ / ⇧⇥</td><td>縮排／取消縮排</td></tr>
+        </table>
+      </div>
+    </div>
+  </main>
+
+  <footer id="status">
+    <span id="stPath" class="path"></span>
+    <span id="stPos"></span>
+    <span class="sp"></span>
+    <span id="stNotice" class="notice"></span>
+    <button class="sb" id="stWrap" title="自動換行">換行</button>
+    <button class="sb" id="stIndent" title="縮排方式"></button>
+    <button class="sb" id="stEol" title="換行字元（點一下切換）"></button>
+    <span id="stEnc"></span>
+    <select id="stLang" title="語言"></select>
+  </footer>
+
+  <div id="ctxMenu" class="menu" hidden></div>
+
+  <div id="modal" hidden>
+    <form id="modalBox">
+      <div id="modalTitle"></div>
+      <input id="modalInput" spellcheck="false" autocomplete="off">
+      <div id="modalHint"></div>
+      <div class="acts">
+        <button type="button" class="secondary" id="modalCancel">取消</button>
+        <button type="submit" id="modalOk">確定</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- highlight.js 核心是 CommonJS：借一個 module 物件載入。它的頂層函式（例如 highlight）會成為全域名稱，app.js 不要用同樣的名字 -->
+  <script>var module = { exports: {} };</script>
+  <script src="../node_modules/highlight.js/lib/core.js"></script>
+  <script>window.hljs = module.exports; module = undefined;</script>
+  <script src="tooldock://sdk/ui-sdk.js"></script>
+  <script src="code-core.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

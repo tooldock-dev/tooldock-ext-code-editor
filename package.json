@@ -1,0 +1,103 @@
+{
+  "name": "code-editor",
+  "version": "1.0.0",
+  "description": "程式碼編輯器：專案檔案樹、語法高亮、Git 異動清單與差異比對",
+  "main": "backend/index.js",
+  "private": true,
+  "scripts": {
+    "dev": "tooldock-ext dev",
+    "debug": "tooldock-ext dev --inspect",
+    "validate": "tooldock-ext validate",
+    "test": "node --test test/*.test.js",
+    "pack": "tooldock-ext pack",
+    "install-local": "tooldock-ext install"
+  },
+  "tooldock": {
+    "id": "code-editor",
+    "displayName": "程式碼編輯器",
+    "description": "像記事本一樣輕巧的程式碼編輯器：建立專案、瀏覽資料夾、語法高亮、多分頁編輯、尋找取代；Git 異動清單與並排／行內差異比對",
+    "icon": "💻",
+    "engine": "^1.4.0",
+    "activationEvents": [],
+    "contributes": {
+      "views": [
+        {
+          "id": "codeEditor.main",
+          "title": "程式碼編輯器",
+          "icon": "💻",
+          "entry": "ui/index.html"
+        }
+      ],
+      "commands": [
+        {
+          "id": "codeEditor.open",
+          "title": "程式碼編輯器：開啟"
+        },
+        {
+          "id": "codeEditor.addProject",
+          "title": "程式碼編輯器：建立專案…"
+        },
+        {
+          "id": "codeEditor.openFile",
+          "title": "程式碼編輯器：開啟檔案…"
+        },
+        {
+          "id": "codeEditor.showChanges",
+          "title": "程式碼編輯器：Git 異動清單"
+        }
+      ],
+      "configuration": {
+        "codeEditor.fontSize": {
+          "type": "number",
+          "default": 13,
+          "title": "字級",
+          "description": "像素"
+        },
+        "codeEditor.tabSize": {
+          "type": "number",
+          "default": 4,
+          "title": "Tab 寬度"
+        },
+        "codeEditor.insertSpaces": {
+          "type": "boolean",
+          "default": true,
+          "title": "以空白縮排",
+          "description": "按 Tab 時插入空白而不是 Tab 字元"
+        },
+        "codeEditor.wordWrap": {
+          "type": "boolean",
+          "default": false,
+          "title": "自動換行"
+        },
+        "codeEditor.exclude": {
+          "type": "string",
+          "default": "node_modules, .git, .svn, .hg, .DS_Store, Thumbs.db, __pycache__",
+          "title": "檔案樹排除",
+          "description": "逗號分隔，可用 * 萬用字元（例如 *.pyc）"
+        },
+        "codeEditor.gitPath": {
+          "type": "string",
+          "default": "",
+          "title": "git 執行檔",
+          "description": "留空時自動尋找"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "highlight.js": "^11.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tooldock-cli": "^1.1.0",
+    "tooldock-types": "^1.1.0"
+  },
+  "keywords": [
+    "tooldock",
+    "code-editor",
+    "editor",
+    "syntax-highlighting",
+    "git",
+    "diff"
+  ]
+}

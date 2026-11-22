@@ -1,0 +1,157 @@
+'use strict';
+/**
+ * 程式碼編輯器後端：專案清單、專案檔案樹、檔案讀寫、Git 異動清單與比對內容。
+ * 編輯中的內容在畫面上；後端只處理檔案系統與 git。
+ */
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const files = require('./files');
+const git = require('./git');
+
+let ctx = null;
+let pendingCommand = null; // 畫面還沒開時收到的指令
+
+const setting = (k, d) => {
+  const v = ctx.settings.get(`codeEditor.${k}`, d);
+  return v === undefined ? d : v;
+};
+const exclude = () => setting('exclude', 'node_modules, .git, .svn, .hg, .DS_Store, Thumbs.db, __pycache__');
+const gitPath = () => setting('gitPath', '') || undefined;
+
+/* ───────────── 專案 ───────────── */
+
+const projects = () => ctx.storage.get('projects', []);
+
+function project(id) {
+  const p = projects().find((x) => x.id === id);
+  if (!p) throw new Error('找不到這個專案');
+  return p;
+}
+
+function addProject({ root, name }) {
+  if (typeof root !== 'string' || !path.isAbsolute(root)) throw new Error('資料夾路徑不正確');
+  let st;
+  try { st = fs.statSync(root); } catch { throw new Error('資料夾不存在'); }
+  if (!st.isDirectory()) throw new Error('請選擇資料夾');
+  const list = projects();
+  const same = list.find((p) => path.resolve(p.root) === path.resolve(root));
+  if (same) return { project: same, existed: true, projects: list };
+  const p = {
+    id: crypto.randomUUID(),
+    name: String(name || '').trim().slice(0, 100) || path.basename(root) || root,
+    root: path.resolve(root),
+    createdAt: Date.now(),
+  };
+  const next = [...list, p];
+  ctx.storage.set('projects', next);
+  ctx.log.info(`建立專案「${p.name}」：${p.root}`);
+  return { project: p, existed: false, projects: next };
+}
+
+function renameProject({ id, name }) {
+  const n = String(name || '').trim().slice(0, 100);
+  if (!n) throw new Error('專案名稱不能是空的');
+  const next = projects().map((p) => (p.id === id ? { ...p, name: n } : p));
+  ctx.storage.set('projects', next);
+  return next;
+}
+
+function removeProject(id) {
+  const next = projects().filter((p) => p.id !== id);
+  ctx.storage.set('projects', next);
+  ctx.storage.delete(`state:${id}`);
+  if (ctx.storage.get('lastProject') === id) ctx.storage.set('lastProject', next[0] ? next[0].id : null);
+  return next;
+}
+
+/* ───────────── 啟用 ───────────── */
+
+exports.activate = (context) => {
+  ctx = context;
+  const h = (name, fn) => ctx.ui.handle(name, fn);
+
+  h('info', () => {
+    const last = ctx.storage.get('lastProject', null);
+    return {
+      settings: ctx.settings.all(),
+      projects: projects(),
+      lastProject: last,
+      state: last ? ctx.storage.get(`state:${last}`, null) : null,
+      recent: ctx.storage.get('recent', []),
+      platform: ctx.platform.version,
+      sep: path.sep,
+    };
+  });
+
+  // 專案
+  h('addProject', (opts) => addProject(opts));
+  h('renameProject', (opts) => renameProject(opts));
+  h('removeProject', (id) => removeProject(id));
+  h('selectProject', (id) => {
+    ctx.storage.set('lastProject', id);
+    return id ? ctx.storage.get(`state:${id}`, null) : null;
+  });
+  h('saveState', ({ id, state }) => {
+    if (id) ctx.storage.set(`state:${id}`, state);
+    return true;
+  });
+
+  // 檔案樹
+  h('listDir', ({ id, rel }) => files.listDir(project(id).root, rel || '', exclude()));
+  h('listFiles', (id) => files.listFiles(project(id).root, exclude()));
+  h('create', ({ id, dir, name, isDir }) => files.create(project(id).root, dir || '', name, isDir));
+  h('rename', ({ id, rel, name }) => files.rename(project(id).root, rel, name));
+
+  // 檔案
+  h('read', (file) => {
+    const doc = files.readText(file);
+    return doc;
+  });
+  h('write', (doc) => files.writeText(doc));
+  h('stat', (file) => {
+    try { return { mtime: fs.statSync(file).mtimeMs }; } catch { return null; }
+  });
+  h('rememberRecent', (file) => {
+    const recent = [file, ...ctx.storage.get('recent', []).filter((f) => f !== file)].slice(0, 15);
+    ctx.storage.set('recent', recent);
+    return recent;
+  });
+  h('reveal', (file) => ctx.shell.showItemInFolder(file));
+
+  // Git
+  h('gitStatus', (id) => git.status(project(id).root, gitPath()));
+  h('gitDiff', async ({ id, top, area, path: rel, orig }) => {
+    const p = project(id);
+    // top 必須是這個專案所在的儲存庫
+    const real = await git.topLevel(p.root, gitPath());
+    if (!real || path.resolve(top) !== real) throw new Error('儲存庫已變更，請重新整理');
+    return git.diffSides(real, { area, path: rel, orig }, gitPath());
+  });
+
+  h('takePending', () => {
+    const c = pendingCommand;
+    pendingCommand = null;
+    return c;
+  });
+
+  const toView = async (command) => {
+    pendingCommand = command;
+    await ctx.window.openView('codeEditor.main');
+    ctx.ui.emit('command', { command });
+  };
+  ctx.subscriptions.push(
+    ctx.commands.register('codeEditor.open', () => ctx.window.openView('codeEditor.main')),
+    ctx.commands.register('codeEditor.addProject', () => toView('addProject')),
+    ctx.commands.register('codeEditor.openFile', () => toView('openFile')),
+    ctx.commands.register('codeEditor.showChanges', () => toView('showChanges')),
+    ctx.settings.onDidChange((key) => ctx.ui.emit('settingsChanged', { key, settings: ctx.settings.all() })),
+  );
+};
+
+exports.deactivate = () => {
+  pendingCommand = null;
+};
+
+// 測試用
+exports._internal = { addProject, renameProject, removeProject, setContext: (c) => { ctx = c; } };
