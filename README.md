@@ -2,7 +2,7 @@
 
 ToolDock 擴充：像記事本一樣輕巧的程式碼編輯器。建立專案、瀏覽資料夾、語法高亮編輯，並查看 Git 異動與差異比對。
 
-ToolDock 1.8.0 起已內建這個擴充；1.4.0 到 1.7.x 的使用者可以從擴充商店安裝。商店發佈新版時，內建版本也會收到更新。
+ToolDock 1.4.0 以上可以從擴充商店安裝。ToolDock 1.8.x 曾經內建這個擴充，1.9.0 起改由商店提供；從 1.8.x 升級的使用者安裝後，原本的專案與設定都還在。
 
 ## 功能
 
@@ -77,7 +77,7 @@ npm test
 
 開發模式使用獨立的資料目錄（`ToolDock-ExtDev`），可以和平常使用的 ToolDock 同時開啟。
 
-> 這個擴充同時是 ToolDock 的內建擴充，原始碼也放在 ToolDock repo 的 `extensions/code-editor/`。兩邊的 `backend/`、`ui/`、`test/` 應保持一致：先在其中一邊修改，再同步到另一邊。
+> 1.9.0 起這個 repo 是唯一的原始碼。ToolDock repo 的自我測試會從平台 repo 旁的這個資料夾以連結方式安裝，測試畫面與 Git 比對，修改後可以在 ToolDock repo 執行 `npm run selftest` 一併確認。
 
 ## 發佈
 
