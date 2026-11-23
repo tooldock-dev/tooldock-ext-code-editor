@@ -23,6 +23,8 @@ const st = {
   fileList: null, // 檔名搜尋用（專案內所有檔案）
   git: null,
   gitCollapsed: new Set(),
+  gitPick: new Set(), // 「變更」清單中選取的項目（area:path），可一次還原
+  gitAnchor: null, // ⇧ 點選範圍的起點
   gitMap: new Map(), // 專案相對路徑 → 狀態字母
   gitDirs: new Map(), // 有異動的資料夾 → 狀態字母
   side: 'files',
@@ -1053,8 +1055,15 @@ function renderGit() {
   head.innerHTML = `<div class="br"><span>⎇</span><span class="name" title="${esc(g.upstream ? `追蹤 ${g.upstream}` : '')}">${esc(g.branch || '（未知分支）')}</span>`
     + `${ab ? `<span class="ab" title="領先 ${g.ahead}、落後 ${g.behind} 個提交">${ab}</span>` : ''}<button class="ib sm" data-act="refreshGit" title="重新整理">⟳</button></div>`
     + `<div class="head" title="${esc(g.head)}">${g.noCommits ? '尚未有任何提交' : esc(g.head)}</div>`;
+  prunePicks();
+  box.classList.toggle('picking', st.gitPick.size > 0);
   if (!total) { box.innerHTML = '<div class="empty-msg">沒有異動，工作目錄是乾淨的 ✓</div>'; return; }
   const rows = [];
+  if (st.gitPick.size) {
+    rows.push(`<div class="pickbar"><span class="pn">已選取 ${st.gitPick.size} 個檔案</span>`
+      + '<button class="sm" data-pact="restore" title="捨棄所選檔案的變更；未追蹤的檔案會被刪除">↶ 還原所選</button>'
+      + '<button class="ib sm" data-pact="clear" title="取消選取（Esc）">✕</button></div>');
+  }
   for (const [area, title] of GIT_GROUPS) {
     const list = g[area];
     if (!list.length) continue;
@@ -1066,7 +1075,10 @@ function renderGit() {
       const name = basename(e.rel);
       const dir = dirname(e.rel);
       const sel = activeDiffKey() === `${area}:${e.path}` ? ' sel' : '';
-      rows.push(`<div class="row${sel}" data-area="${area}" data-i="${i}" title="${esc(`${e.rel}（${e.label}${e.orig ? `，原為 ${e.orig}` : ''}）`)}" style="padding-left:20px">`
+      const pickable = PICK_AREAS.has(area);
+      const picked = pickable && st.gitPick.has(pickKey(area, e)) ? ' picked' : '';
+      rows.push(`<div class="row${sel}${picked}" data-area="${area}" data-i="${i}" title="${esc(`${e.rel}（${e.label}${e.orig ? `，原為 ${e.orig}` : ''}）`)}" style="padding-left:20px">`
+        + (pickable ? `<input type="checkbox" class="pk" tabindex="-1" ${picked ? 'checked' : ''} title="選取（${IS_MAC ? '⌘' : 'Ctrl'} 點選加選、⇧ 點選範圍）">` : '')
         + `<span class="ic">${iconFor(name)}</span><span class="nm g-${esc(e.status)}">${esc(name)}</span><span class="dir">${esc(dir)}</span>`
         + (area === 'unstaged' || area === 'untracked' ? `<span class="acts"><button class="ib xs" data-rv="1" title="${area === 'untracked' ? '刪除未追蹤的檔案' : '捨棄變更（改回暫存區的版本）'}">↶</button></span>` : '')
         + `<span class="gs g-${esc(e.status)}">${e.status === '?' ? 'U' : esc(e.status)}</span></div>`);
@@ -1076,6 +1088,70 @@ function renderGit() {
 }
 
 const activeDiffKey = () => { const t = activeTab(); return t && t.kind === 'diff' ? `${t.entry.area}:${t.entry.path}` : ''; };
+
+/* 「變更」清單多選：只有工作目錄的變更與未追蹤的檔案可以選（已暫存的不還原） */
+const PICK_AREAS = new Set(['unstaged', 'untracked']);
+const pickKey = (area, e) => `${area}:${e.path}`;
+
+/** 去掉已經不在清單中的選取（例如還原後、git 狀態改變後） */
+function prunePicks() {
+  const g = st.git;
+  if (!g || !g.repo) { st.gitPick.clear(); return; }
+  const alive = new Set();
+  for (const area of PICK_AREAS) for (const e of g[area]) alive.add(pickKey(area, e));
+  for (const k of [...st.gitPick]) if (!alive.has(k)) st.gitPick.delete(k);
+  if (st.gitAnchor && !alive.has(st.gitAnchor)) st.gitAnchor = null;
+}
+
+function pickedEntries() {
+  const g = st.git;
+  if (!g || !g.repo) return [];
+  const out = [];
+  for (const area of PICK_AREAS) for (const e of g[area]) if (st.gitPick.has(pickKey(area, e))) out.push(e);
+  return out;
+}
+
+/** 目前畫面上可選的列，依顯示順序 */
+const pickRows = () => [...$$('#changes .row[data-area]')].filter((r) => PICK_AREAS.has(r.dataset.area));
+const rowKey = (row) => pickKey(row.dataset.area, gitEntry(row));
+
+function togglePick(row) {
+  if (!PICK_AREAS.has(row.dataset.area)) { notice('已暫存的變更不能在這裡還原，只能選取「變更」與「未追蹤」中的檔案'); return; }
+  const k = rowKey(row);
+  if (st.gitPick.has(k)) st.gitPick.delete(k); else st.gitPick.add(k);
+  st.gitAnchor = k;
+  renderGit();
+}
+
+/** ⇧ 點選：從上次點選的列到這一列全部選取 */
+function pickRange(row) {
+  if (!PICK_AREAS.has(row.dataset.area)) return;
+  const rows = pickRows();
+  const to = rows.indexOf(row);
+  const from = st.gitAnchor ? rows.findIndex((r) => rowKey(r) === st.gitAnchor) : -1;
+  if (from < 0) { togglePick(row); return; }
+  for (let i = Math.min(from, to); i <= Math.max(from, to); i++) st.gitPick.add(rowKey(rows[i]));
+  renderGit();
+}
+
+function clearPicks() {
+  if (!st.gitPick.size) return false;
+  st.gitPick.clear();
+  st.gitAnchor = null;
+  renderGit();
+  return true;
+}
+
+function pickAll() {
+  for (const r of pickRows()) st.gitPick.add(rowKey(r));
+  renderGit();
+}
+
+async function restorePicked() {
+  const list = pickedEntries();
+  if (!list.length) return;
+  await restoreEntries(list);
+}
 const gitEntry = (row) => st.git[row.dataset.area][Number(row.dataset.i)];
 
 function setSide(side) {
@@ -2010,7 +2086,11 @@ async function restoreEntries(entries) {
   const message = one
     ? (un ? `要刪除未追蹤的檔案「${one}」嗎？` : `要捨棄「${one}」的變更嗎？`)
     : onlyDelete ? `要刪除 ${un} 個未追蹤的檔案嗎？` : `要還原 ${entries.length} 個檔案嗎？`;
+  const names = entries.length > 1
+    ? entries.slice(0, 12).map((e) => `• ${e.rel}${e.area === 'untracked' ? '（未追蹤，刪除）' : ''}`).join('\n') + (entries.length > 12 ? `\n…等 ${entries.length} 個檔案` : '')
+    : '';
   const detail = [
+    names,
     tr ? '工作目錄的修改會被捨棄，改回暫存區的版本（沒有 git add 過時，就是最近一次提交的版本）。已暫存的變更不受影響。' : '',
     un ? '未追蹤的檔案會被刪除（不會移到垃圾桶）。' : '',
     '還原後可以按「復原」改回來（只在這次開啟 ToolDock 期間有效）。',
@@ -2793,13 +2873,28 @@ function bind() {
     const h = e.target.closest('.grp-h');
     if (h && e.target.closest('[data-rvall]')) { restoreEntries(st.git[h.dataset.grp]).catch(fail); return; }
     if (h) { const g = h.dataset.grp; if (st.gitCollapsed.has(g)) st.gitCollapsed.delete(g); else st.gitCollapsed.add(g); renderGit(); return; }
+    const pa = e.target.closest('[data-pact]');
+    if (pa) { if (pa.dataset.pact === 'restore') restorePicked().catch(fail); else clearPicks(); return; }
     const row = e.target.closest('.row[data-area]');
     if (row && e.target.closest('[data-rv]')) { restoreEntries([gitEntry(row)]).catch(fail); return; }
-    if (row) openDiff(gitEntry(row)).catch(fail);
+    if (row && e.target.closest('.pk')) { togglePick(row); return; }
+    if (row && (IS_MAC ? e.metaKey : e.ctrlKey)) { togglePick(row); return; }
+    if (row && e.shiftKey) { pickRange(row); return; }
+    if (row) {
+      st.gitAnchor = PICK_AREAS.has(row.dataset.area) ? rowKey(row) : null;
+      if (st.gitPick.size) { st.gitPick.clear(); renderGit(); }
+      openDiff(gitEntry(row)).catch(fail);
+    }
+  });
+  // ⇧ 點選不要選到文字
+  changes.addEventListener('mousedown', (e) => { if (e.shiftKey && e.target.closest('.row[data-area]')) e.preventDefault(); });
+  changes.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && clearPicks()) { e.preventDefault(); e.stopPropagation(); return; }
+    if ((IS_MAC ? e.metaKey : e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'a') { e.preventDefault(); e.stopPropagation(); pickAll(); }
   });
   changes.addEventListener('dblclick', (e) => {
     const row = e.target.closest('.row[data-area]');
-    if (!row || e.target.closest('[data-rv]')) return;
+    if (!row || e.target.closest('[data-rv], .pk') || e.metaKey || e.ctrlKey || e.shiftKey) return;
     const en = gitEntry(row);
     if (en.status === 'D') openDiff(en, { preview: false }).catch(fail);
     else openFile(en.file).catch(fail);
@@ -2814,7 +2909,13 @@ function bind() {
     const row = e.target.closest('.row[data-area]');
     if (!row) return;
     const en = gitEntry(row);
+    const picked = PICK_AREAS.has(row.dataset.area) && st.gitPick.has(rowKey(row));
+    if (picked && st.gitPick.size > 1) {
+      contextMenu(e, [[`還原所選的 ${st.gitPick.size} 個檔案…`, () => restorePicked()], ['取消選取', () => clearPicks()]]);
+      return;
+    }
     const items = [['查看差異', () => openDiff(en, { preview: false })]];
+    if (PICK_AREAS.has(row.dataset.area)) items.push([picked ? '取消選取' : '選取（可多選後一次還原）', () => togglePick(row)]);
     if (en.status !== 'D') items.push(['開啟檔案', () => openFile(en.file)]);
     if (!en.rel.startsWith('..') && en.status !== 'D') items.push(['在檔案樹中顯示', () => revealInTree(en.rel)]);
     if (en.area !== 'untracked' && en.status !== 'A') items.push(['檔案歷史', () => openHistory(en.file)]);
