@@ -30,6 +30,7 @@ const st = {
   side: 'files',
   diffMode: 'sbs',
   find: { open: false, caseSens: false, regex: false },
+  targets: [], // 能接收 git-tool.project 的其他工具（Git 工具等）
 };
 
 const project = () => st.projects.find((p) => p.id === st.pid) || null;
@@ -681,6 +682,44 @@ async function switchProject(id, state) {
   }
 }
 
+/* ───────────── 和其他工具共享專案（git-tool.project） ───────────── */
+
+/** 重新查詢能接收專案的工具（Git 工具等），更新選單與 Git 面板的按鈕 */
+async function refreshTargets() {
+  try {
+    st.targets = td.exchange ? await td.exchange.receivers('git-tool.project') : [];
+  } catch { st.targets = []; }
+  const item = $('#openInItem');
+  item.hidden = !st.targets.length || !project();
+  item.textContent = targetLabel();
+  renderGit();
+}
+const targetLabel = () => (st.targets.length === 1 ? st.targets[0].title || `在${st.targets[0].name}開啟` : '在其他工具開啟…');
+const targetName = () => (st.targets.length === 1 ? st.targets[0].name : '其他工具');
+
+/** 把目前的專案交給 Git 工具；file 為絕對路徑時一併帶上 */
+async function openInFlow({ file, line } = {}) {
+  const p = project();
+  if (!p || !td.exchange) return;
+  const payload = { name: p.name, path: p.root };
+  const rel = file ? relOf(file) : null;
+  if (rel) { payload.file = rel; if (line) payload.line = line; }
+  const pkg = await td.exchange.create('git-tool.project', payload, { title: p.name, description: p.root });
+  const r = await td.exchange.share(pkg, { fallback: 'none' });
+  if (r.status === 'no-receiver') { notice('沒有可以接收專案的工具，可以到擴充商店安裝「Git 工具」', 'err'); refreshTargets(); return; }
+  if (r.status === 'error') throw new Error(r.message || '無法交給其他工具');
+  if (r.status === 'delivered' && r.result && r.result.status === 'rejected') throw new Error(r.result.message || '對方無法開啟這個專案');
+}
+
+/** 其他工具（Git 工具）送來的專案：切換過去，有指定檔案時開啟並跳到該行 */
+async function openProjectCommand(c) {
+  st.projects = await td.invoke('projects');
+  if (st.pid !== c.id) await switchProject(c.id);
+  else renderProjects();
+  if (st.pid !== c.id) return; // 使用者取消了切換（有未儲存的分頁）
+  if (c.file) await openFile(c.file, { line: c.line || undefined });
+}
+
 async function renameProject() {
   const p = project();
   if (!p) return;
@@ -1044,7 +1083,8 @@ function renderGit() {
   if (!g) { head.innerHTML = ''; box.innerHTML = '<div class="empty-msg">讀取 Git 狀態…</div>'; return; }
   if (!g.repo) {
     head.innerHTML = '';
-    box.innerHTML = `<div class="empty-msg">${esc(g.message || '這個專案不是 Git 儲存庫')}<br><button class="secondary sm" data-act="refreshGit">重新檢查</button></div>`;
+    box.innerHTML = `<div class="empty-msg">${esc(g.message || '這個專案不是 Git 儲存庫')}<br><button class="secondary sm" data-act="refreshGit">重新檢查</button>`
+      + `${st.targets.length ? ` <button class="secondary sm" data-act="openInGit" title="在 ${esc(targetName())}建立儲存庫（git init）">${esc(targetLabel())}</button>` : ''}</div>`;
     count.hidden = true;
     return;
   }
@@ -1053,7 +1093,8 @@ function renderGit() {
   count.textContent = total > 999 ? '999+' : String(total);
   const ab = [g.ahead ? `↑${g.ahead}` : '', g.behind ? `↓${g.behind}` : ''].filter(Boolean).join(' ');
   head.innerHTML = `<div class="br"><span>⎇</span><span class="name" title="${esc(g.upstream ? `追蹤 ${g.upstream}` : '')}">${esc(g.branch || '（未知分支）')}</span>`
-    + `${ab ? `<span class="ab" title="領先 ${g.ahead}、落後 ${g.behind} 個提交">${ab}</span>` : ''}<button class="ib sm" data-act="refreshGit" title="重新整理">⟳</button></div>`
+    + `${ab ? `<span class="ab" title="領先 ${g.ahead}、落後 ${g.behind} 個提交">${ab}</span>` : ''}`
+    + `${st.targets.length ? `<button class="ib sm" data-act="openInGit" title="${esc(targetLabel())}：提交、推送、拉取、分支線圖">🌿</button>` : ''}<button class="ib sm" data-act="refreshGit" title="重新整理">⟳</button></div>`
     + `<div class="head" title="${esc(g.head)}">${g.noCommits ? '尚未有任何提交' : esc(g.head)}</div>`;
   prunePicks();
   box.classList.toggle('picking', st.gitPick.size > 0);
@@ -2787,6 +2828,7 @@ const ACTIONS = {
   renameProject: () => renameProject(),
   removeProject: () => removeProject(),
   revealProject: () => project() && td.invoke('reveal', project().root),
+  openInGit: () => openInFlow(),
   newFile: () => newUntitled(),
   openFile: () => openFileDialog(),
   newFileIn: () => st.pid && createIn(selDir(), false),
@@ -2798,6 +2840,7 @@ const ACTIONS = {
 };
 
 async function runCommand(cmd) {
+  if (cmd && typeof cmd === 'object') { if (cmd.command === 'openProject') await openProjectCommand(cmd); return; }
   if (cmd === 'addProject') await addProject();
   else if (cmd === 'openFile') await openFileDialog();
   else if (cmd === 'showChanges') { setSide('git'); await refreshGit(); }
@@ -2833,7 +2876,13 @@ function bind() {
   $('#addProjBtn').onclick = () => addProject().catch(fail);
   $('#welcomeAdd').onclick = () => addProject().catch(fail);
   $('#welcomeOpen').onclick = () => openFileDialog().catch(fail);
-  $('#projMenuBtn').onclick = () => { const m = $('#projMenu'); const show = m.hidden; closeMenus(); m.hidden = !show; };
+  $('#projMenuBtn').onclick = () => {
+    const m = $('#projMenu');
+    const show = m.hidden;
+    closeMenus();
+    m.hidden = !show;
+    if (show) refreshTargets();
+  };
   for (const b of $$('#sideTabs button')) b.onclick = () => setSide(b.dataset.side);
 
   const tree = $('#tree');
@@ -3028,6 +3077,7 @@ async function init() {
   else { renderProjects(); renderTree(); }
   renderTabs();
   updateStatusBar();
+  refreshTargets();
   await drainPending();
 }
 

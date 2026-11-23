@@ -12,9 +12,10 @@ const search = require('./search');
 const symbols = require('./symbols');
 const decompiler = require('./decompile');
 const edits = require('./edits');
+const P = require('./project');
 
 let ctx = null;
-let pendingCommand = null; // 畫面還沒開時收到的指令
+let pendingCommand = null; // 畫面還沒開時收到的指令：字串，或從其他工具開啟專案時的物件 { command, ... }
 
 const setting = (k, d) => {
   const v = ctx.settings.get(`codeEditor.${k}`, d);
@@ -79,6 +80,37 @@ function removeProject(id) {
   return next;
 }
 
+/* ───────────── 從其他工具開啟專案（git-tool.project） ───────────── */
+
+/** 接收 git-tool.project：建立或切換到同一個專案，有指定檔案時一併開啟 */
+function importProject(pkg, info = {}) {
+  let p;
+  try {
+    p = P.parsePayload(pkg && pkg.payload, { origin: info.origin });
+  } catch (err) {
+    // 平台不會顯示接收端的拒絕原因，自己告訴使用者（例如從交換檔選了程式碼編輯器）
+    ctx.window.toast(err.message, 'warn').catch(() => {});
+    return { status: 'rejected', message: err.message };
+  }
+  let proj = P.pickProject(projects(), p);
+  let added = false;
+  if (!proj) {
+    const res = addProject({ root: p.root, name: p.name });
+    proj = res.project;
+    added = !res.existed;
+  }
+  ctx.storage.set('lastProject', proj.id);
+  pendingCommand = { command: 'openProject', id: proj.id, file: p.file, line: p.line };
+  ctx.ui.emit('command', { command: pendingCommand });
+  const from = info.producer ? `（來自 ${info.producer.name}）` : '';
+  ctx.log.info(`開啟專案「${proj.name}」${from}：${proj.root}${p.file ? `，檔案 ${p.file}` : ''}`);
+  return {
+    status: 'imported',
+    message: `已在程式碼編輯器開啟「${proj.name}」${p.file ? `的 ${path.basename(p.file)}` : ''}`,
+    data: { projectId: proj.id, root: proj.root, added },
+  };
+}
+
 /* ───────────── 啟用 ───────────── */
 
 exports.activate = (context) => {
@@ -102,6 +134,7 @@ exports.activate = (context) => {
 
   // 專案
   h('addProject', (opts) => addProject(opts));
+  h('projects', () => projects());
   h('renameProject', (opts) => renameProject(opts));
   h('removeProject', (id) => removeProject(id));
   h('selectProject', (id) => {
@@ -241,6 +274,12 @@ exports.activate = (context) => {
   );
 };
 
+/** contributes.exchange.imports 的 handler：接收 git-tool.project */
+exports.importProject = (context, pkg, info) => {
+  if (!ctx) ctx = context;
+  return importProject(pkg, info);
+};
+
 exports.deactivate = () => {
   pendingCommand = null;
   search.cancel();
@@ -248,4 +287,4 @@ exports.deactivate = () => {
 };
 
 // 測試用
-exports._internal = { addProject, renameProject, removeProject, setContext: (c) => { ctx = c; } };
+exports._internal = { addProject, renameProject, removeProject, importProject, takePending: () => { const c = pendingCommand; pendingCommand = null; return c; }, setContext: (c) => { ctx = c; } };

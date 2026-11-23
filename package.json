@@ -1,6 +1,6 @@
 {
   "name": "code-editor",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "程式碼編輯器：專案檔案樹、語法高亮、跳到定義、反編譯、跨檔案搜尋取代、Git 異動清單、差異比對、還原與檔案歷史",
   "main": "backend/index.js",
   "private": true,
@@ -15,7 +15,7 @@
   "tooldock": {
     "id": "code-editor",
     "displayName": "程式碼編輯器",
-    "description": "像記事本一樣輕巧的程式碼編輯器：建立專案、瀏覽資料夾、語法高亮、多分頁編輯、尋找取代、跳到定義、跨檔案搜尋與取代、反編譯 .class；Git 異動清單、並排／行內差異比對、還原變更與檔案歷史",
+    "description": "像記事本一樣輕巧的程式碼編輯器：建立專案、瀏覽資料夾、語法高亮、多分頁編輯、尋找取代、跳到定義、跨檔案搜尋與取代、反編譯 .class；Git 異動清單、並排／行內差異比對、還原變更與檔案歷史；可以和 Git 工具互相開啟同一個專案",
     "icon": "💻",
     "engine": "^1.4.0",
     "activationEvents": [],
@@ -107,6 +107,16 @@
           "title": "java 執行檔",
           "description": "反編譯 .class 用（java 或 JDK 資料夾）；留空時自動尋找"
         }
+      },
+      "exchange": {
+        "imports": [
+          {
+            "type": "git-tool.project",
+            "handler": "importProject",
+            "title": "在程式碼編輯器開啟",
+            "view": "codeEditor.main"
+          }
+        ]
       }
     }
   },
