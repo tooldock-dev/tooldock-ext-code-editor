@@ -12,6 +12,9 @@ ToolDock 1.4.0 以上可以從擴充商店安裝。ToolDock 1.8.x 曾經內建�
   - `⌘P`（Windows 為 `Ctrl+P`）以檔名搜尋整個專案，方向鍵選擇、Enter 開啟。
   - 右鍵可以新增檔案或資料夾、重新命名、複製路徑或相對路徑、在 Finder／檔案總管中顯示。
   - 設定 `codeEditor.exclude` 可以排除不想看到的檔案，預設排除 `node_modules`、`.git` 等。
+- **在終端機開啟**：檔案樹上方的 `>_`、專案選單「⋯」的「在終端機開啟」、`⌘⇧C`（Windows 為 `Ctrl+Shift+C`），或命令面板「程式碼編輯器：在終端機開啟專案」，會另開一個工作目錄是專案資料夾的終端機視窗。檔案樹的資料夾右鍵可以開那個資料夾，檔案右鍵開它所在的資料夾。
+  - macOS 預設用「終端機」，Windows 依序用 Windows Terminal、PowerShell、cmd，Linux 用 `x-terminal-emulator`（找不到時試 gnome-terminal、konsole、xfce4-terminal、kitty、alacritty、xterm）。
+  - 想用別的終端機，在設定 `codeEditor.terminal` 填入：macOS 填 App 名稱（例如 `iTerm`、`Warp`、`Ghostty`）或 `.app` 的路徑；其他平台填執行檔路徑（Windows 也可以是 `.cmd`／`.bat`）。
 - **語法高亮**：使用 [highlight.js](https://highlightjs.org/)，支援 50 多種語言，依副檔名自動判斷，也可以在狀態列切換。語言模組依需要載入。
 - **編輯**：
   - 多分頁。單擊檔案以「預覽分頁」開啟（斜體），點下一個檔案時會被取代，方便一路瀏覽；開始編輯或雙擊就會固定。
@@ -75,6 +78,7 @@ ToolDock 1.4.0 以上可以從擴充商店安裝。ToolDock 1.8.x 曾經內建�
 - **擴充資料**：專案清單、各專案開著的檔案與展開的資料夾、最近開啟的檔案、自訂的快捷鍵，存在擴充的資料夾（`ctx.storage`）。
 - **外部程式**：Git 功能會執行 `git`（`rev-parse`、`status`、`log`、`cat-file`、`ls-files`），**都是只讀取的指令，不會修改暫存區、分支與提交**；還原時由擴充自己寫入工作目錄的檔案，內容以 `git cat-file --filters` 取得，會套用換行轉換與 Git LFS 等過濾器，和 `git checkout` 寫出的內容相同。`status` 以 `GIT_OPTIONAL_LOCKS=0` 執行，不會和你自己的 git 指令搶鎖。找不到 git 時依序嘗試常見的安裝位置，也可以在設定 `codeEditor.gitPath` 指定。
 - **反編譯**：開啟 `.class` 時執行 `java -jar vendor/cfr-0.152.jar <檔案> --silent true`（找 Java 時會執行 `java -version`，macOS 另外執行 `/usr/libexec/java_home`）；結果只顯示在分頁中，不寫入任何檔案。
+- **終端機**：按「在終端機開啟」時才執行，只開到專案資料夾內的資料夾。macOS 執行 `open -a <App> <資料夾>`；其他平台以那個資料夾為工作目錄啟動終端機程式（見「在終端機開啟」）。設定 `codeEditor.terminal` 填了執行檔路徑時，直接執行那個程式，不帶參數。
 - **網路**：不連網。
 - **其他擴充**：和 Git 工具互相開啟專案時透過平台的資料交換，格式是 Git 工具定義的 `git-tool.project`；交給 Git 工具的只有專案名稱與資料夾路徑。從 `.tdx` 交換檔收到的專案（別人分享的）不會在這裡開啟，請先用 Git 工具複製。
 

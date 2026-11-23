@@ -895,8 +895,16 @@ function onTreeContext(e) {
   items.push(['複製路徑', () => copyText(abs)]);
   if (row) items.push(['複製相對路徑', () => copyText(rel)]);
   items.push([IS_MAC ? '在 Finder 中顯示' : '在檔案總管中顯示', () => td.invoke('reveal', abs)]);
+  items.push([row && !isDir ? '在終端機開啟所在資料夾' : '在終端機開啟', () => openTerminalAt(dir)]);
   items.push('-', ['重新整理', () => refreshAll()]);
   contextMenu(e, items);
+}
+
+/** 在終端機開啟專案裡的資料夾（rel 為空字串時是專案根目錄） */
+async function openTerminalAt(rel = '') {
+  if (!project()) { notice('請先建立或選擇專案', 'err'); return; }
+  const r = await td.invoke('openTerminal', { id: st.pid, rel });
+  notice(`已在終端機開啟 ${r.dir}`);
 }
 
 async function createIn(dir, isDir) {
@@ -2539,6 +2547,7 @@ const KEY_COMMANDS = [
   { id: 'navForward', group: '前往', title: '前往下一個位置', mac: ['Ctrl+Shift+-'], win: ['Alt+Right'], run: () => navGo(1) },
   { id: 'toggleComment', group: '編輯', title: '切換行註解', mac: ['Mod+/'], win: ['Mod+/'], editor: true, run: () => toggleCommentAtCaret() },
   { id: 'wordWrap', group: '編輯', title: '切換自動換行', mac: ['Alt+Z'], win: ['Alt+Z'], run: () => td.settings.update('codeEditor.wordWrap', !setting('wordWrap', false)) },
+  { id: 'openTerminal', group: '其他', title: '在終端機開啟專案', mac: ['Mod+Shift+C'], win: ['Mod+Shift+C'], run: () => openTerminalAt('') },
   { id: 'keybindings', group: '其他', title: '鍵盤快捷鍵', mac: ['Mod+K'], win: ['Mod+K'], run: () => openKeysPanel() },
 ];
 const KEY_BY_ID = Object.fromEntries(KEY_COMMANDS.map((c) => [c.id, c]));
@@ -2576,6 +2585,7 @@ function refreshKeyLabels() {
   $('#findNext').title = `下一個（Enter${keyLabel('findNext') ? `、${keyLabel('findNext')}` : ''}）`;
   $('#findPrev').title = `上一個（Shift+Enter${keyLabel('findPrev') ? `、${keyLabel('findPrev')}` : ''}）`;
   $('#stKeys').title = `鍵盤快捷鍵${keyLabel('keybindings') ? `（${keyLabel('keybindings')}）` : ''}`;
+  $('#termBtn').title = `在終端機開啟專案${keyLabel('openTerminal') ? `（${keyLabel('openTerminal')}）` : ''}`;
   const shown = [['quickOpen', 'save'], ['find', 'gotoLine'], ['toggleComment', null], ['searchProject', 'replaceProject'], ['definition', 'navBack'], ['keybindings', null]];
   const cell = (id) => (id ? `<td>${esc(keyLabel(id) || '—')}</td><td>${esc(KEY_BY_ID[id].title)}</td>` : '<td></td><td></td>');
   $('#welcomeKeys').innerHTML = shown.map(([a, b]) => `<tr>${cell(a)}${b ? cell(b) : a === 'toggleComment' ? `<td>${IS_MAC ? '⇥ / ⇧⇥' : 'Tab / Shift+Tab'}</td><td>縮排／取消縮排</td>` : cell(null)}</tr>`).join('');
@@ -2828,6 +2838,7 @@ const ACTIONS = {
   renameProject: () => renameProject(),
   removeProject: () => removeProject(),
   revealProject: () => project() && td.invoke('reveal', project().root),
+  openTerminal: () => openTerminalAt(''),
   openInGit: () => openInFlow(),
   newFile: () => newUntitled(),
   openFile: () => openFileDialog(),
@@ -2846,6 +2857,7 @@ async function runCommand(cmd) {
   else if (cmd === 'showChanges') { setSide('git'); await refreshGit(); }
   else if (cmd === 'search') openSearch(false);
   else if (cmd === 'keybindings') openKeysPanel();
+  else if (cmd === 'openTerminal') await openTerminalAt('');
 }
 
 async function drainPending() {

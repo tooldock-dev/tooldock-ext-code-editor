@@ -12,6 +12,7 @@ const search = require('./search');
 const symbols = require('./symbols');
 const decompiler = require('./decompile');
 const edits = require('./edits');
+const terminal = require('./terminal');
 const P = require('./project');
 
 let ctx = null;
@@ -167,6 +168,12 @@ exports.activate = (context) => {
     return recent;
   });
   h('reveal', (file) => ctx.shell.showItemInFolder(file));
+  // 在終端機開啟專案裡的資料夾；rel 是檔案時開它所在的資料夾
+  h('openTerminal', ({ id, rel }) => {
+    let dir = files.resolveIn(project(id).root, rel || '');
+    try { if (!fs.statSync(dir).isDirectory()) dir = path.dirname(dir); } catch { throw new Error('資料夾不存在'); }
+    return terminal.open(dir, setting('terminal', ''));
+  });
 
   // 自訂快捷鍵：{ 功能 id: [組合鍵…] }，只存和預設不同的
   h('setKeybindings', (map) => {
@@ -270,6 +277,7 @@ exports.activate = (context) => {
     ctx.commands.register('codeEditor.showChanges', () => toView('showChanges')),
     ctx.commands.register('codeEditor.search', () => toView('search')),
     ctx.commands.register('codeEditor.keybindings', () => toView('keybindings')),
+    ctx.commands.register('codeEditor.openTerminal', () => toView('openTerminal')),
     ctx.settings.onDidChange((key) => ctx.ui.emit('settingsChanged', { key, settings: ctx.settings.all() })),
   );
 };

@@ -15,7 +15,7 @@
   "tooldock": {
     "id": "code-editor",
     "displayName": "程式碼編輯器",
-    "description": "像記事本一樣輕巧的程式碼編輯器：建立專案、瀏覽資料夾、語法高亮、多分頁編輯、尋找取代、跳到定義、跨檔案搜尋與取代、反編譯 .class；Git 異動清單、並排／行內差異比對、還原變更與檔案歷史；可以和 Git 工具互相開啟同一個專案",
+    "description": "像記事本一樣輕巧的程式碼編輯器：建立專案、瀏覽資料夾、語法高亮、多分頁編輯、尋找取代、跳到定義、跨檔案搜尋與取代、反編譯 .class；Git 異動清單、並排／行內差異比對、還原變更與檔案歷史；可以和 Git 工具互相開啟同一個專案；一鍵在終端機開啟專案資料夾",
     "icon": "💻",
     "engine": "^1.4.0",
     "activationEvents": [],
@@ -52,6 +52,10 @@
         {
           "id": "codeEditor.keybindings",
           "title": "程式碼編輯器：鍵盤快捷鍵"
+        },
+        {
+          "id": "codeEditor.openTerminal",
+          "title": "程式碼編輯器：在終端機開啟專案"
         }
       ],
       "configuration": {
@@ -106,6 +110,12 @@
           "default": "",
           "title": "java 執行檔",
           "description": "反編譯 .class 用（java 或 JDK 資料夾）；留空時自動尋找"
+        },
+        "codeEditor.terminal": {
+          "type": "string",
+          "default": "",
+          "title": "終端機程式",
+          "description": "「在終端機開啟」用的程式。macOS 填 App 名稱（例如 iTerm、Warp）；其他平台填執行檔路徑。留空時 macOS 用「終端機」，Windows 依序用 Windows Terminal、PowerShell、cmd，Linux 用系統預設的終端機"
         }
       },
       "exchange": {
