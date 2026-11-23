@@ -83,6 +83,18 @@
           "title": "檔案樹排除",
           "description": "逗號分隔，可用 * 萬用字元（例如 *.pyc）"
         },
+        "codeEditor.searchExclude": {
+          "type": "string",
+          "default": "Pods, DerivedData, .expo, .next, .nuxt, .gradle, .dart_tool, .venv, venv, bower_components, coverage, *.min.js, *.min.css, *.map",
+          "title": "搜尋排除",
+          "description": "跨檔案搜尋與跳到定義不看的檔案或資料夾（檔案樹照常顯示）。逗號分隔，語法同 .gitignore：名稱比對任何一層，含 / 的路徑從專案根目錄算起（例如 docs/build）"
+        },
+        "codeEditor.searchUseGitignore": {
+          "type": "boolean",
+          "default": true,
+          "title": "搜尋時套用 .gitignore",
+          "description": "git 專案裡被 .gitignore 忽略的檔案（例如 build、dist）不搜尋，也不列入跳到定義"
+        },
         "codeEditor.gitPath": {
           "type": "string",
           "default": "",

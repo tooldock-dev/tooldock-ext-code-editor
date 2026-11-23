@@ -6,7 +6,7 @@
  */
 const fs = require('fs');
 const crypto = require('crypto');
-const { writeAtomic } = require('./files');
+const { writeAtomic, notifyChange } = require('./files');
 
 const KEEP = 10; // 保留最近幾次操作
 const MAX_BACKUP = 64 * 1024 * 1024; // 一次操作最多備份的總大小；超過的檔案不能復原
@@ -51,6 +51,7 @@ class Op {
   remove(file) {
     const entry = this.backup(file);
     fs.rmSync(file);
+    notifyChange(file);
     entry.after = null;
     if (!this.files.includes(entry)) this.files.push(entry);
   }
@@ -79,7 +80,7 @@ function undo(id) {
     if (!same) { skipped.push({ file: f.file, reason: '之後又被修改過' }); continue; }
     try {
       if (f.existed) writeAtomic(f.file, f.before, f.mode);
-      else fs.rmSync(f.file, { force: true });
+      else { fs.rmSync(f.file, { force: true }); notifyChange(f.file); }
       restored.push(f.file);
     } catch (err) {
       skipped.push({ file: f.file, reason: err.message });

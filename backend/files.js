@@ -53,21 +53,31 @@ function listDir(root, rel, exclude) {
 
 const toRel = (p) => String(p).split(path.sep).join('/');
 
-/** 專案內所有檔案的相對路徑（檔名搜尋用）；不進入符號連結的資料夾 */
-function listFiles(root, exclude, limit = MAX_LIST) {
+/**
+ * 專案內所有檔案的相對路徑；不進入符號連結的資料夾。
+ * opts.ignore（ignore.js 的 Ignorer）：略過搜尋排除與 .gitignore 忽略的項目，被忽略的資料夾整個不進去。
+ * opts.start：只列出這個資料夾底下（相對路徑）。
+ * 回傳 { files, truncated, ignored（被忽略而略過的項目數） }
+ */
+function listFiles(root, exclude, limit = MAX_LIST, { ignore = null, start = '' } = {}) {
   const skip = excluder(exclude);
   const files = [];
-  const queue = [''];
+  const queue = [start];
   let truncated = false;
-  while (queue.length) {
-    const rel = queue.shift();
+  let ignored = 0;
+  let head = 0;
+  while (head < queue.length) {
+    const rel = queue[head++];
     let ents;
     try { ents = fs.readdirSync(path.join(root, rel), { withFileTypes: true }); } catch { continue; }
     ents.sort((a, b) => collator.compare(a.name, b.name));
+    const frame = ignore ? ignore.frame(rel, new Set(ents.map((d) => d.name))) : null;
     for (const d of ents) {
       if (skip(d.name)) continue;
       const r = rel ? `${rel}/${d.name}` : d.name;
-      if (d.isDirectory()) queue.push(r);
+      const isDir = d.isDirectory();
+      if (ignore && ignore.ignored(r, isDir, frame)) { ignored++; continue; }
+      if (isDir) queue.push(r);
       else if (d.isFile() || d.isSymbolicLink()) {
         if (files.length >= limit) { truncated = true; break; }
         files.push(r);
@@ -75,7 +85,14 @@ function listFiles(root, exclude, limit = MAX_LIST) {
     }
     if (truncated) break;
   }
-  return { files, truncated };
+  return { files, truncated, ignored };
+}
+
+/** 檔案異動通知：這個擴充自己寫入、新增、改名、刪除檔案時呼叫，讓符號索引不必等檔案監看的事件 */
+const changeListeners = new Set();
+function onChange(fn) { changeListeners.add(fn); return () => changeListeners.delete(fn); }
+function notifyChange(...abs) {
+  for (const fn of changeListeners) for (const f of abs) { try { fn(f); } catch { /* 忽略 */ } }
 }
 
 /** 前 8 KB 有 NUL 字元就當成二進位檔 */
@@ -146,6 +163,7 @@ function writeAtomic(file, data, mode) {
     try { fs.rmSync(tmp, { force: true }); } catch { /* 忽略 */ }
     throw err;
   }
+  notifyChange(file);
   return fs.statSync(file);
 }
 
@@ -169,6 +187,7 @@ function create(root, dirRel, name, isDir) {
   if (fs.existsSync(target)) throw new Error('已有同名的檔案或資料夾');
   if (isDir) fs.mkdirSync(target);
   else fs.writeFileSync(target, '', { flag: 'wx' });
+  notifyChange(target);
   return { file: target, rel: toRel(path.relative(root, target)) };
 }
 
@@ -179,9 +198,10 @@ function rename(root, rel, name) {
   if (to === from) return { file: to, rel: toRel(path.relative(root, to)) };
   if (fs.existsSync(to) && to.toLowerCase() !== from.toLowerCase()) throw new Error('已有同名的檔案或資料夾');
   fs.renameSync(from, to);
+  notifyChange(from, to);
   return { from, file: to, rel: toRel(path.relative(root, to)) };
 }
 
 module.exports = {
-  excluder, inside, resolveIn, listDir, listFiles, decodeText, readText, encodeText, writeAtomic, writeText, create, rename, isBinary, toRel, MAX_OPEN,
+  excluder, inside, resolveIn, listDir, listFiles, onChange, notifyChange, decodeText, readText, encodeText, writeAtomic, writeText, create, rename, isBinary, toRel, MAX_OPEN,
 };

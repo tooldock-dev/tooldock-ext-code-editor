@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const C = require('../ui/code-core');
 const files = require('./files');
+const { Ignorer, scopeOf } = require('./ignore');
 
 const MAX_FILE = 10 * 1024 * 1024; // 超過就不搜尋
 const MAX_MATCHES = 20000; // 全部檔案合計最多列出的筆數
@@ -32,19 +33,28 @@ function searchFile(abs, re, opts, limit) {
 
 /**
  * 搜尋專案：opts = { query, regex, caseSens, word, include, exclude, skip（不搜尋的相對路徑，例如已在編輯器開啟的檔案）, only（只搜尋這些相對路徑） }
+ * scopeArg：檔案樹排除清單字串，或 { exclude, patterns（搜尋排除）, gitignore }（見 ignore.js）。
+ * 回傳的 hidden 是 skip 裡落在排除範圍內的路徑（畫面據此不搜尋這些已開啟的分頁），ignored 是被搜尋排除或 .gitignore 略過的項目數。
  * 新的搜尋開始時，還在跑的舊搜尋會停止並回傳 { canceled: true }。
  */
-async function search(root, opts, excludeSetting) {
+async function search(root, opts, scopeArg) {
+  const scope = scopeOf(scopeArg);
+  const excludeSetting = scope.exclude;
   const token = ++current;
   let re;
   try { re = C.searchRegex(opts); } catch (err) { throw new Error(`規則運算式有誤：${err.message}`); }
-  if (!re) return { files: [], total: 0, searched: 0, skipped: {}, truncated: false };
+  if (!re) return { files: [], total: 0, searched: 0, skipped: {}, truncated: false, hidden: [], ignored: 0 };
   const keep = C.pathFilter(opts.include, opts.exclude);
   const skipSet = new Set(opts.skip || []);
+  const ignore = scope.patterns || scope.gitignore ? new Ignorer(root, scope) : null;
+  const skipName = files.excluder(excludeSetting);
+  const hidden = Array.isArray(opts.only) ? [] : [...skipSet].filter((rel) => typeof rel === 'string'
+    && (rel.split('/').some(skipName) || (ignore && ignore.pathIgnored(rel, false))));
   let list;
   let tooMany = false;
+  let ignored = 0;
   if (Array.isArray(opts.only)) list = opts.only.filter((r) => typeof r === 'string');
-  else ({ files: list, truncated: tooMany } = files.listFiles(root, excludeSetting, MAX_SEARCH_FILES));
+  else ({ files: list, truncated: tooMany, ignored } = files.listFiles(root, excludeSetting, MAX_SEARCH_FILES, { ignore }));
   const out = [];
   const skipped = { binary: 0, large: 0 };
   let total = 0;
@@ -69,7 +79,7 @@ async function search(root, opts, excludeSetting) {
     }
     if (r.truncated || total >= MAX_MATCHES) { truncated = true; break; }
   }
-  return { files: out, total, searched, skipped, truncated, tooMany };
+  return { files: out, total, searched, skipped, truncated, tooMany, hidden, ignored };
 }
 
 function cancel() { current++; }

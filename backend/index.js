@@ -23,6 +23,13 @@ const setting = (k, d) => {
 const exclude = () => setting('exclude', 'node_modules, .git, .svn, .hg, .DS_Store, Thumbs.db, __pycache__');
 const gitPath = () => setting('gitPath', '') || undefined;
 const javaPath = () => String(setting('javaPath', '') || '').trim();
+const DEFAULT_SEARCH_EXCLUDE = 'Pods, DerivedData, .expo, .next, .nuxt, .gradle, .dart_tool, .venv, venv, bower_components, coverage, *.min.js, *.min.css, *.map';
+/** 搜尋與符號索引的範圍；useIgnore 為 false 時只套用檔案樹排除清單 */
+const searchScope = (useIgnore = true) => ({
+  exclude: exclude(),
+  patterns: useIgnore ? String(setting('searchExclude', DEFAULT_SEARCH_EXCLUDE) || '') : '',
+  gitignore: useIgnore && setting('searchUseGitignore', true) !== false,
+});
 
 /* ───────────── 專案 ───────────── */
 
@@ -64,8 +71,8 @@ function renameProject({ id, name }) {
 
 function removeProject(id) {
   const gone = projects().find((p) => p.id === id);
-  if (gone) symbols.forget(gone.root);
   const next = projects().filter((p) => p.id !== id);
+  if (gone) symbols.forget(gone.root, { purge: !next.some((p) => p.root === gone.root) });
   ctx.storage.set('projects', next);
   ctx.storage.delete(`state:${id}`);
   if (ctx.storage.get('lastProject') === id) ctx.storage.set('lastProject', next[0] ? next[0].id : null);
@@ -77,6 +84,7 @@ function removeProject(id) {
 exports.activate = (context) => {
   ctx = context;
   const h = (name, fn) => ctx.ui.handle(name, fn);
+  symbols.configure({ dataDir: ctx.paths && ctx.paths.data, watch: true });
 
   h('info', () => {
     const last = ctx.storage.get('lastProject', null);
@@ -159,7 +167,7 @@ exports.activate = (context) => {
   const done = (op, extra) => ({ ...extra, undoId: edits.commit(op) });
 
   // 跨檔案搜尋與取代
-  h('search', ({ id, ...opts }) => search.search(project(id).root, opts, exclude()));
+  h('search', ({ id, useIgnore, ...opts }) => search.search(project(id).root, opts, searchScope(useIgnore !== false)));
   h('cancelSearch', () => { search.cancel(); return true; });
   h('replaceInFiles', ({ id, label, items }) => {
     const op = edits.begin(label || '取代');
@@ -171,7 +179,7 @@ exports.activate = (context) => {
   h('undo', (undoId) => edits.undo(undoId));
 
   // 跳到定義（符號索引）
-  h('definitions', ({ id, ...o }) => symbols.definitions(project(id).root, exclude(), o));
+  h('definitions', ({ id, ...o }) => symbols.definitions(project(id).root, searchScope(true), o));
 
   // .class 反編譯：回傳和 read 相同形狀的文件（唯讀）
   h('decompile', async (file) => {
@@ -236,6 +244,7 @@ exports.activate = (context) => {
 exports.deactivate = () => {
   pendingCommand = null;
   search.cancel();
+  symbols.close();
 };
 
 // 測試用

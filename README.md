@@ -31,13 +31,15 @@ ToolDock 1.4.0 以上可以從擴充商店安裝。ToolDock 1.8.x 曾經內建�
   - `⌃-`（Windows 為 `Alt+←`）回到跳轉前的位置，`⌃⇧-`（`Alt+→`）再往前。
   - 不分析型別，而是依各語言的定義寫法（`function`、`class`、`def`、方法簽章、`CREATE PROCEDURE`…）建立專案的符號索引。同名的定義有好幾個時會列出清單（↑↓ 選擇、Enter 開啟），依序是：`import`／`require` 指到的檔案、同一個檔案、同語言同資料夾、同語言、其他語言；能從 `import` 確定來源時直接跳過去。
   - 支援 JavaScript／TypeScript、Java、Kotlin、Scala、Groovy、C#、C／C++／Objective-C、Python、Go、Rust、PHP、Ruby、Swift、Dart、Lua、Perl、PowerShell、VB、Shell，以及 SQL／PL-SQL（不分大小寫）。
-  - 第一次使用時建立索引，之後只重新解析修改過的檔案；尚未儲存的分頁以編輯器中的內容為準。找不到定義，或游標就在定義上時，改為尋找所有參考。
+  - 第一次使用時建立索引，存在擴充的資料夾裡；重新啟動 ToolDock 後只要檢查一次哪些檔案改過，不用重新解析整個專案。之後在 macOS 與 Windows 監看專案資料夾，只處理有變動的檔案（其他平台每次查詢時檢查修改時間）。尚未儲存的分頁以編輯器中的內容為準。找不到定義，或游標就在定義上時，改為尋找所有參考。
+  - 和跨檔案搜尋一樣不看「搜尋排除」設定與 `.gitignore` 忽略的檔案。
 - **反編譯 .class**：
   - 在檔案樹開啟 `.class` 檔，會以附帶的 [CFR](https://www.benf.org/other/cfr/) 反編譯成 Java 原始碼，在唯讀分頁中語法高亮顯示；同一個資料夾中的內部類別（`Outer$Inner.class`）會一起還原。可以「另存新檔」存成 `.java`。
   - 需要 Java 執行環境（8 以上）：依序使用設定 `codeEditor.javaPath`、`JAVA_HOME`、macOS 的 `/usr/libexec/java_home`、`PATH` 上的 `java`。找不到 Java 時改為只顯示類別結構（類別、欄位、方法的宣告，不含方法內容）。
   - 請只反編譯你有權使用的程式。
 - **跨檔案搜尋與取代**（側欄「搜尋」分頁，`⌘⇧F` 搜尋、`⌘⇧H` 取代）：
   - 可區分大小寫、整個字相符、使用規則運算式；「檔案篩選」可以指定要包含或排除的檔案（`*.js, src/`、`test, *.min.js`，支援 `*`、`**`、`{a,b}`）。檔案樹的排除設定也會套用。
+  - 大型專案只搜尋原始碼：略過設定 `codeEditor.searchExclude` 列出的資料夾（預設有 `Pods`、`DerivedData`、`.expo`、`.next`、`.gradle`、`venv`、`*.min.js` 等），以及 git 專案中被 `.gitignore`（含巢狀的 `.gitignore` 與 `.git/info/exclude`）忽略的檔案，這些資料夾整個不會走進去。檔案樹照常顯示它們。「檔案篩選」裡取消勾選「套用搜尋排除設定與 .gitignore」就會連這些檔案一起搜尋。
   - 結果依檔案分組列出每一處的行號與前後文；點一下開啟並選取那一處，方向鍵可以一路瀏覽。檔案樹的資料夾右鍵有「在這個資料夾中搜尋…」。
   - 展開取代後，清單會顯示取代前後的對照（刪除線／新增），**先檢查再取代**：可以逐一取代、取代一個檔案，或勾選後「取代所選」；不想取代的項目取消勾選或從清單移除。
   - 規則運算式的取代字串可以用 `$1`、`$<名稱>`、`$&`，以及 `\n`、`\t`。
@@ -111,6 +113,8 @@ macOS 以 `⌘`、Windows／Linux 以 `Ctrl` 表示。都可以在「鍵盤快�
 | `codeEditor.insertSpaces` | true | 按 Tab 時插入空白 |
 | `codeEditor.wordWrap` | false | 自動換行 |
 | `codeEditor.exclude` | `node_modules, .git, .svn, .hg, .DS_Store, Thumbs.db, __pycache__` | 檔案樹排除，逗號分隔，可用 `*` |
+| `codeEditor.searchExclude` | `Pods, DerivedData, .expo, .next, .nuxt, .gradle, .dart_tool, .venv, venv, bower_components, coverage, *.min.js, *.min.css, *.map` | 跨檔案搜尋與跳到定義不看的檔案或資料夾，逗號分隔，語法同 `.gitignore`（名稱比對任何一層，含 `/` 的路徑從專案根目錄算起） |
+| `codeEditor.searchUseGitignore` | true | 跨檔案搜尋與跳到定義略過 `.gitignore` 忽略的檔案 |
 | `codeEditor.gitPath` | （空白） | git 執行檔，留空時自動尋找 |
 | `codeEditor.javaPath` | （空白） | 反編譯用的 java 執行檔或 JDK 資料夾，留空時自動尋找；有設定時只用這個路徑 |
 
@@ -163,6 +167,7 @@ backend/
   index.js      啟用、專案清單、畫面呼叫的方法、指令
   files.js      目錄列表、檔名搜尋、讀寫、新增與重新命名
   search.js     跨檔案搜尋與取代
+  ignore.js     搜尋範圍：搜尋排除設定與 .gitignore 規則
   edits.js      改寫檔案前的備份與復原
   symbols.js    符號索引（跳到定義）
   decompile.js  .class 反編譯（CFR），找 Java

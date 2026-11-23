@@ -1503,6 +1503,7 @@ const srch = {
   regex: false,
   showRep: false,
   more: false,
+  useIgnore: true, // 套用搜尋排除設定與 .gitignore
   query: null, // 目前結果使用的搜尋條件
   result: null, // { files: [{ rel, file, readOnly, matches: [{ ..., off }], collapsed }], total, truncated, tooMany, error }
   running: false,
@@ -1512,7 +1513,7 @@ const srch = {
   sel: -1, // 鍵盤選取的列
 };
 const collator = new Intl.Collator('zh-Hant', { numeric: true, sensitivity: 'base' });
-const SEARCH_PREFS = ['caseSens', 'word', 'regex', 'showRep', 'more'];
+const SEARCH_PREFS = ['caseSens', 'word', 'regex', 'showRep', 'more', 'useIgnore'];
 
 function loadSearchPrefs() {
   const p = store.get('search', {});
@@ -1535,7 +1536,9 @@ function syncSearchForm() {
   $('#sRepRow').hidden = !srch.showRep;
   $('#sRepToggle').textContent = srch.showRep ? '▾' : '▸';
   $('#sMore').hidden = !srch.more;
-  $('#sMoreBtn').textContent = `${srch.more ? '▾' : '▸'} 檔案篩選${!srch.more && ($('#sInclude').value || $('#sExclude').value) ? '（使用中）' : ''}`;
+  $('#sUseIgnore').checked = srch.useIgnore;
+  const custom = $('#sInclude').value || $('#sExclude').value || !srch.useIgnore;
+  $('#sMoreBtn').textContent = `${srch.more ? '▾' : '▸'} 檔案篩選${!srch.more && custom ? '（使用中）' : ''}`;
 }
 
 const searchOpts = () => ({
@@ -1545,6 +1548,7 @@ const searchOpts = () => ({
   word: srch.word,
   include: $('#sInclude').value,
   exclude: $('#sExclude').value,
+  useIgnore: srch.useIgnore,
 });
 
 /** 專案內已開啟的檔案分頁（以編輯器中的內容搜尋與取代） */
@@ -1600,8 +1604,9 @@ async function runSearch() {
     if (seq !== srch.seq || r.canceled) return;
     const list = [...r.files];
     let total = r.total;
+    const hidden = new Set(r.hidden || []);
     for (const [rel, t] of open) {
-      if (!keep(rel)) continue;
+      if (!keep(rel) || hidden.has(rel)) continue;
       const f = searchBuffer(t, rel, re, o.regex);
       if (f.matches.length) { list.push(f); total += f.matches.length; }
     }
@@ -1645,6 +1650,7 @@ function renderSearchBar() {
   else if (r) {
     const n = countAll();
     msg = n ? `${r.files.length.toLocaleString()} 個檔案中有 ${n.toLocaleString()} 筆結果` : '沒有結果';
+    if (!n && r.ignored) msg += `<br><span class="faint">有 ${r.ignored.toLocaleString()} 個檔案或資料夾依搜尋排除設定與 .gitignore 略過，可在「檔案篩選」取消套用</span>`;
     if (r.truncated) msg += `<br><span class="warn">結果太多，只列出前 ${r.total.toLocaleString()} 筆，請縮小搜尋範圍</span>`;
     if (r.tooMany) msg += '<br><span class="warn">專案檔案太多，只搜尋了一部分</span>';
     const sk = r.skipped || {};
@@ -1951,6 +1957,7 @@ function bindSearch() {
   }
   $('#sRepToggle').onclick = () => { srch.showRep = !srch.showRep; syncSearchForm(); saveSearchPrefs(); renderSearch(); if (srch.showRep) $('#sReplace').focus(); };
   $('#sMoreBtn').onclick = () => { srch.more = !srch.more; syncSearchForm(); saveSearchPrefs(); if (srch.more) $('#sInclude').focus(); };
+  $('#sUseIgnore').onchange = () => { srch.useIgnore = $('#sUseIgnore').checked; syncSearchForm(); saveSearchPrefs(); runSearch().catch(fail); };
   for (const id of ['#sInclude', '#sExclude']) {
     $(id).addEventListener('input', () => { saveSearchPrefs(); runSearchSoon(500); });
     $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch().catch(fail); } });
