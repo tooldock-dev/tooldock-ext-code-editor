@@ -1,5 +1,5 @@
 'use strict';
-/* 程式碼編輯器畫面：專案、檔案樹、多分頁編輯（高亮）、跨檔案搜尋與取代、Git 異動清單、差異比對、還原與檔案歷史 */
+/* 程式碼編輯器畫面：專案、檔案樹、多分頁編輯（高亮）、跳到定義、class 反編譯、跨檔案搜尋與取代、Git 異動清單、差異比對、還原與檔案歷史 */
 const td = window.tooldock;
 const C = window.CodeCore;
 const hljs = window.hljs;
@@ -367,12 +367,6 @@ function onEditorKey(e, view) {
   } else if (e.key === 'Enter' && !mod && !e.altKey && !e.shiftKey) {
     e.preventDefault();
     applyEdit(view, C.newline(ta.value, ta.selectionStart, ta.selectionEnd, indentUnit()));
-  } else if (mod && e.key === '/') {
-    e.preventDefault();
-    if (ta.readOnly) return;
-    const tok = C.lineComment(view.tab.lang);
-    if (!tok) { notice(`${C.LANG_NAME[view.tab.lang] || view.tab.lang} 沒有行註解`); return; }
-    applyEdit(view, C.toggleComment(ta.value, ta.selectionStart, ta.selectionEnd, tok));
   } else if (['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
     requestAnimationFrame(() => view.onCaret(true));
   }
@@ -442,6 +436,9 @@ function addTab(t) {
   return t;
 }
 
+/** 讀取要放進分頁的內容：.class 反編譯，其他檔案照原樣讀取 */
+const readDoc = (file) => td.invoke(/\.class$/i.test(file) ? 'decompile' : 'read', file);
+
 /** 開啟檔案；preview 時取代目前的預覽分頁（沒有修改過的才會被取代） */
 async function openFile(file, { preview = false, line, col } = {}) {
   let t = st.tabs.find((x) => x.kind === 'file' && x.file === file);
@@ -451,7 +448,7 @@ async function openFile(file, { preview = false, line, col } = {}) {
     if (line) t.view.gotoLine(line, col);
     return t;
   }
-  const doc = await td.invoke('read', file);
+  const doc = await readDoc(file);
   t = { kind: 'file', file, name: doc.name, title: file, preview };
   const old = preview ? st.tabs.find((x) => x.preview && !isDirty(x)) : null;
   addTab(t);
@@ -482,11 +479,13 @@ function fillDoc(t, doc) {
   t.encoding = doc.encoding;
   t.readOnly = doc.readOnly;
   t.savedText = doc.text;
-  if (!t.langManual) t.lang = C.langFor(t.name);
+  t.decompiled = doc.decompiled || '';
+  if (!t.langManual) t.lang = t.decompiled ? 'java' : C.langFor(t.name);
   t.view.tab.lang = t.lang;
   t.view.setReadOnly(t.readOnly);
   t.view.setText(doc.text);
-  if (t.readOnly) notice(`${t.name} 以 ${t.encoding.toUpperCase()} 開啟，為唯讀`);
+  if (t.decompiled) notice(`${t.name}：${doc.note}`);
+  else if (t.readOnly) notice(`${t.name} 以 ${t.encoding.toUpperCase()} 開啟，為唯讀`);
   ensureLang(t.lang).then(() => t.view.render(true));
 }
 
@@ -532,11 +531,12 @@ async function closeAll(except) {
 
 async function save(t = activeTab(), as = false) {
   if (!t || t.kind !== 'file' || t.unavailable) return false;
-  if (t.readOnly) { notice(`${t.encoding.toUpperCase()} 編碼的檔案為唯讀，請另存新檔（會存成 UTF-8）`); if (!as) return false; }
+  if (t.decompiled && !as) { notice('反編譯的內容為唯讀，可以「另存新檔」存成 .java'); return false; }
+  if (t.readOnly && !t.decompiled) { notice(`${t.encoding.toUpperCase()} 編碼的檔案為唯讀，請另存新檔（會存成 UTF-8）`); if (!as) return false; }
   let file = t.file;
   if (!file || as) {
     const p = project();
-    const r = await td.dialog.save({ title: '另存新檔', defaultPath: t.file || (p ? `${p.root}${st.info.sep}${t.name}` : t.name) });
+    const r = await td.dialog.save({ title: '另存新檔', defaultPath: t.decompiled ? t.file.replace(/\.class$/i, '.java') : t.file || (p ? `${p.root}${st.info.sep}${t.name}` : t.name) });
     if (r.canceled || !r.filePath) return false;
     file = r.filePath;
   }
@@ -544,7 +544,7 @@ async function save(t = activeTab(), as = false) {
   try {
     const r = await td.invoke('write', { file, text, eol: t.eol, bom: t.bom });
     const renamed = file !== t.file;
-    Object.assign(t, { file, name: r.name, title: file, mtime: r.mtime, savedText: text, preview: false, readOnly: false, encoding: 'utf8' });
+    Object.assign(t, { file, name: r.name, title: file, mtime: r.mtime, savedText: text, preview: false, readOnly: false, encoding: 'utf8', decompiled: '' });
     t.view.setReadOnly(false);
     if (renamed) {
       if (!t.langManual) t.view.setLang(C.langFor(r.name));
@@ -574,14 +574,14 @@ async function checkExternal(t) {
     if (!t.mtime || s.mtime === t.mtime) return;
     if (!isDirty(t)) {
       const vs = t.view.saveViewState();
-      fillDoc(t, await td.invoke('read', t.file));
+      fillDoc(t, await readDoc(t.file));
       t.view.restoreViewState(vs);
       notice(`${t.name} 已在外部修改，已重新載入`);
       return;
     }
     if (t.id !== st.active) return;
     banner(`「${t.name}」已在外部修改，但這裡也有尚未儲存的變更。`, [
-      ['重新載入（放棄這裡的變更）', async () => { fillDoc(t, await td.invoke('read', t.file)); renderTabs(); }],
+      ['重新載入（放棄這裡的變更）', async () => { fillDoc(t, await readDoc(t.file)); renderTabs(); }],
       ['保留這裡的版本', () => { t.mtime = s.mtime; }],
     ]);
   } catch { /* 忽略 */ } finally {
@@ -597,7 +597,8 @@ function updateStatusBar() {
   $('#stPath').textContent = t ? (t.file ? (relOf(t.file) ?? t.file) : t.name) : '';
   $('#stPath').title = t && t.file ? t.file : '';
   for (const id of ['#stWrap', '#stIndent', '#stEol', '#stLang']) $(id).hidden = !isFile;
-  $('#stEnc').textContent = isFile ? (t.encoding === 'utf8' ? (t.bom ? 'UTF-8 BOM' : 'UTF-8') : `${t.encoding.toUpperCase()}（唯讀）`) : '';
+  $('#stEnc').textContent = !isFile ? '' : t.decompiled ? (t.decompiled === 'cfr' ? '反編譯（唯讀）' : '類別結構（唯讀）')
+    : t.encoding === 'utf8' ? (t.bom ? 'UTF-8 BOM' : 'UTF-8') : `${t.encoding.toUpperCase()}（唯讀）`;
   if (!isFile) { $('#stPos').textContent = ''; return; }
   $('#stWrap').classList.toggle('on', !!setting('wordWrap', false));
   $('#stIndent').textContent = setting('insertSpaces', true) ? `空格：${setting('tabSize', 4)}` : `Tab：${setting('tabSize', 4)}`;
@@ -733,7 +734,7 @@ async function openFileDialog() {
 
 const ICONS = {
   js: '🟨', mjs: '🟨', cjs: '🟨', jsx: '⚛️', ts: '🟦', tsx: '⚛️', json: '🧾', md: '📝', html: '🌐', htm: '🌐', css: '🎨', scss: '🎨', less: '🎨',
-  py: '🐍', java: '☕', cs: '#️⃣', go: '🐹', rs: '🦀', rb: '💎', php: '🐘', sql: '🗃', sh: '🐚', bat: '🐚', ps1: '🐚', xml: '📰', yml: '⚙️', yaml: '⚙️',
+  py: '🐍', java: '☕', class: '☕', jar: '☕', cs: '#️⃣', go: '🐹', rs: '🦀', rb: '💎', php: '🐘', sql: '🗃', sh: '🐚', bat: '🐚', ps1: '🐚', xml: '📰', yml: '⚙️', yaml: '⚙️',
   png: '🖼', jpg: '🖼', jpeg: '🖼', gif: '🖼', svg: '🖼', webp: '🖼', ico: '🖼', pdf: '📕', zip: '📦', lock: '🔒', txt: '📄', log: '📜', env: '🔑',
 };
 const iconFor = (name) => ICONS[(name.split('.').pop() || '').toLowerCase()] || '📄';
@@ -1460,7 +1461,7 @@ async function afterDiskChange(changed) {
     if (isDirty(t)) { checkExternal(t); continue; }
     const vs = t.view.saveViewState && t.view.saveViewState();
     try {
-      fillDoc(t, await td.invoke('read', t.file));
+      fillDoc(t, await readDoc(t.file));
       if (vs) t.view.restoreViewState(vs);
     } catch { /* 檔案讀不到時留給下次檢查 */ }
   }
@@ -1505,6 +1506,7 @@ const srch = {
   query: null, // 目前結果使用的搜尋條件
   result: null, // { files: [{ rel, file, readOnly, matches: [{ ..., off }], collapsed }], total, truncated, tooMany, error }
   running: false,
+  replacing: false, // 取代進行中（避免重複按下）
   seq: 0,
   undo: null, // { id, label }
   sel: -1, // 鍵盤選取的列
@@ -1549,7 +1551,7 @@ const searchOpts = () => ({
 function openFileTabs() {
   const m = new Map();
   for (const t of st.tabs) {
-    if (t.kind !== 'file' || !t.file || t.unavailable) continue;
+    if (t.kind !== 'file' || !t.file || t.unavailable || t.decompiled) continue;
     const rel = relOf(t.file);
     if (rel !== null) m.set(rel, t);
   }
@@ -1653,7 +1655,7 @@ function renderSearchBar() {
   const sel = countSelected();
   let html = msg || acts ? `<div class="sline"><span class="smsg">${msg}</span>${acts}</div>` : '';
   if (srch.showRep && r && r.files && r.files.length) {
-    html += `<div class="sline"><button class="sm" data-sact="replaceSel" ${sel ? '' : 'disabled'}>取代所選（${sel.toLocaleString()}）</button>`
+    html += `<div class="sline"><button class="sm" data-sact="replaceSel" ${sel && !srch.replacing ? '' : 'disabled'}>${srch.replacing ? '取代中…' : `取代所選（${sel.toLocaleString()}）`}</button>`
       + '<button class="ib sm" data-sact="checkAll" title="全選">☑</button><button class="ib sm" data-sact="checkNone" title="全不選">☐</button></div>';
   }
   if (srch.undo) html += `<div class="sline"><button class="secondary sm" data-sact="undo" title="${esc(srch.undo.label)}">↶ 復原上次取代</button><span class="smsg faint">${esc(srch.undo.label)}</span></div>`;
@@ -1738,7 +1740,19 @@ function applySpanEdit(view, old, out) {
  * 取代：targets = [{ f, ms }]。
  * 已開啟且尚未儲存的檔案改在編輯器中取代（可用 ⌘Z 復原）；其餘寫入硬碟（可按「復原上次取代」還原）。
  */
-async function replaceTargets(targets, { confirm = false } = {}) {
+async function replaceTargets(targets, opts = {}) {
+  if (srch.replacing) { notice('正在取代，請稍候'); return; }
+  srch.replacing = true;
+  renderSearchBar();
+  try {
+    await doReplace(targets, opts);
+  } finally {
+    srch.replacing = false;
+    renderSearchBar();
+  }
+}
+
+async function doReplace(targets, { confirm = false } = {}) {
   const q = srch.query;
   if (!q) return;
   const rep = $('#sReplace').value;
@@ -2168,6 +2182,464 @@ async function restoreVersion(view) {
   resultBanner(`已把 ${basename(e.path)} 還原成 ${c.short} 的版本。`, r.undoId);
 }
 
+/* ───────────── 跳到定義 ───────────── */
+
+/** 跳轉紀錄：⌃-（Windows 為 Alt+←）回到上一個位置 */
+const navHist = { back: [], fwd: [] };
+
+function here() {
+  const t = codeTab();
+  if (!t || !t.file) return null;
+  return { file: t.file, s: t.view.ta.selectionStart, e: t.view.ta.selectionEnd, top: t.view.el.scrollTop };
+}
+
+function pushNav() {
+  const l = here();
+  if (!l) return;
+  const last = navHist.back[navHist.back.length - 1];
+  if (last && last.file === l.file && last.s === l.s) return;
+  navHist.back.push(l);
+  if (navHist.back.length > 50) navHist.back.shift();
+  navHist.fwd = [];
+}
+
+async function goLocation(l) {
+  const t = await openFile(l.file);
+  if (!t || t.unavailable) return;
+  const len = t.view.ta.value.length;
+  t.view.focus();
+  t.view.ta.setSelectionRange(Math.min(l.s, len), Math.min(l.e, len));
+  t.view.onCaret();
+  t.view.el.scrollTop = l.top;
+}
+
+async function navGo(dir) {
+  const from = dir < 0 ? navHist.back : navHist.fwd;
+  const to = dir < 0 ? navHist.fwd : navHist.back;
+  const l = from.pop();
+  if (!l) { notice(dir < 0 ? '沒有上一個位置' : '沒有下一個位置'); return; }
+  const cur = here();
+  if (cur) to.push(cur);
+  await goLocation(l).catch(fail);
+}
+
+/** 打開定義所在的檔案並選取名稱 */
+async function openDefinition(d) {
+  pushNav();
+  const t = await openFile(d.file);
+  if (!t || t.unavailable) return;
+  const text = t.view.ta.value;
+  const ls = C.lineStart(text, d.line);
+  let s = ls + d.col - 1;
+  if (text.slice(s, s + d.name.length) !== d.name) {
+    // 檔案在建立索引後改過：在那一行附近找名稱
+    const i = text.indexOf(d.name, ls);
+    s = i >= 0 && i - ls < 400 ? i : ls;
+  }
+  t.view.focus();
+  t.view.ta.setSelectionRange(s, s + (text.slice(s, s + d.name.length) === d.name ? d.name.length : 0));
+  t.view.onCaret();
+  t.view.reveal(true);
+  t.view.markHit(t.view.caretLine());
+}
+
+/** 找名稱的定義：專案索引＋尚未儲存的分頁（以編輯器內容解析） */
+async function findDefinitions(name, t) {
+  const ci = C.symbolCaseInsensitive(t.lang);
+  const same = (n) => (ci ? n.toLowerCase() === name.toLowerCase() : n === name);
+  const local = [];
+  const skip = [];
+  const addLocal = (tab, rel) => {
+    for (const s of C.symbolsIn(tab.view.text, tab.lang)) {
+      if (same(s.name)) local.push({ ...s, rel, file: tab.file, family: C.symbolFamily(tab.lang) });
+    }
+  };
+  for (const x of st.tabs) {
+    if (x.kind !== 'file' || !x.file || x.unavailable || x.decompiled) continue;
+    const rel = relOf(x.file);
+    if (rel !== null && isDirty(x)) { skip.push(rel); addLocal(x, rel); }
+  }
+  // 專案外的檔案（用「開啟檔案」開的）：只找它自己
+  if (t.file && relOf(t.file) === null && !t.decompiled) addLocal(t, t.file);
+  let remote = { items: [] };
+  if (st.pid) remote = await td.invoke('definitions', { id: st.pid, name, ci, skip });
+  return [...local, ...remote.items];
+}
+
+async function goToDefinition(t = codeTab(), pos, at) {
+  if (!t || t.unavailable) return;
+  const ta = t.view.ta;
+  const w = C.wordAt(ta.value, pos === undefined ? ta.selectionStart : pos, t.lang);
+  if (!w) { notice('游標不在名稱上'); return; }
+  if (!C.symbolFamily(t.lang)) notice(`${C.LANG_NAME[t.lang] || t.lang} 沒有定義規則，改用名稱比對所有語言`);
+  const rel = t.file ? relOf(t.file) ?? t.file : null;
+  const timer = setTimeout(() => notice(`尋找「${w.name}」的定義…（第一次會建立索引）`), 300);
+  let items;
+  try { items = await findDefinitions(w.name, t); } finally { clearTimeout(timer); }
+  const cur = C.cursorInfo(ta.value, w.start);
+  const self = rel ? { rel, line: cur.line, col: cur.col } : null;
+  const hints = C.importHints(ta.value, w.name, t.lang, rel || '');
+  const ranked = C.rankDefinitions(items, { rel, family: C.symbolFamily(t.lang), hints, self });
+  if (!ranked.length) {
+    const isSelf = items.length > 0;
+    notice(isSelf ? `這裡就是「${w.name}」的定義，改為尋找所有參考` : `找不到「${w.name}」的定義，改為尋找所有參考`);
+    findReferences(w.name, t);
+    return;
+  }
+  notice('');
+  if (ranked.length === 1 || (ranked[0].score === 0 && ranked[1].score > 0)) { await openDefinition(ranked[0]); return; }
+  showDefPicker(w.name, ranked, at || caretPoint(t));
+}
+
+/** ⇧F12：在專案中搜尋整個字（大小寫相符；SQL 等不分大小寫的語言除外） */
+function findReferences(name, t = codeTab()) {
+  srch.word = true;
+  srch.regex = false;
+  srch.caseSens = !(t && C.symbolCaseInsensitive(t.lang));
+  syncSearchForm();
+  saveSearchPrefs();
+  $('#sQuery').value = name;
+  setSide('search');
+  runSearch().catch(fail);
+}
+
+/** 游標那一行的螢幕位置（顯示候選清單用） */
+function caretPoint(t) {
+  const row = t.view.pre.children[t.view.caretLine()];
+  const r = (row || t.view.el).getBoundingClientRect();
+  return { x: r.left + 60, y: r.bottom + 2 };
+}
+
+const defPick = { list: [], sel: 0 };
+
+function showDefPicker(name, list, at) {
+  const box = $('#defPick');
+  defPick.list = list.slice(0, 100);
+  defPick.sel = 0;
+  const head = `<div class="label">「${esc(name)}」有 ${list.length} 個定義${list.length > 100 ? '（只列出前 100 個）' : ''}　↑↓ 選擇・Enter 開啟・Esc 關閉</div>`;
+  box.innerHTML = head + defPick.list.map((d, i) => `<button class="item dp${i === 0 ? ' on' : ''}" data-i="${i}" title="${esc(`${d.rel}:${d.line}`)}">`
+    + `<span class="row1"><span class="kd">${esc(d.kind)}</span><span class="nm">${esc(d.name)}</span><span class="loc">${esc(basename(d.rel))}:${d.line}</span><span class="dir">${esc(dirname(d.rel))}</span></span>`
+    + `<span class="pv">${esc(d.text)}</span></button>`).join('');
+  box.hidden = false;
+  const r = box.getBoundingClientRect();
+  box.style.left = `${Math.max(4, Math.min(at.x, innerWidth - r.width - 8))}px`;
+  box.style.top = `${at.y + r.height > innerHeight - 8 ? Math.max(4, at.y - r.height - 24) : at.y}px`;
+  box.focus();
+}
+
+function closeDefPicker(refocus = true) {
+  const box = $('#defPick');
+  if (box.hidden) return;
+  box.hidden = true;
+  const t = codeTab();
+  if (refocus && t) t.view.focus();
+}
+
+function markDefPick() {
+  $$('#defPick .dp').forEach((b, i) => b.classList.toggle('on', i === defPick.sel));
+  const on = $('#defPick .dp.on');
+  if (on) on.scrollIntoView({ block: 'nearest' });
+}
+
+function bindDefinitions() {
+  const box = $('#defPick');
+  box.addEventListener('click', (e) => {
+    const b = e.target.closest('.dp');
+    if (!b) return;
+    closeDefPicker(false);
+    openDefinition(defPick.list[Number(b.dataset.i)]).catch(fail);
+  });
+  box.addEventListener('mousemove', (e) => {
+    const b = e.target.closest('.dp');
+    if (b && Number(b.dataset.i) !== defPick.sel) { defPick.sel = Number(b.dataset.i); markDefPick(); }
+  });
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      defPick.sel = Math.max(0, Math.min(defPick.list.length - 1, defPick.sel + (e.key === 'ArrowDown' ? 1 : -1)));
+      markDefPick();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const d = defPick.list[defPick.sel];
+      closeDefPicker(false);
+      if (d) openDefinition(d).catch(fail);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeDefPicker();
+    }
+  });
+  box.addEventListener('focusout', (e) => { if (!box.contains(e.relatedTarget)) setTimeout(() => closeDefPicker(false), 0); });
+  // 按住 ⌘（Windows 為 Ctrl）時游標變成手指，點名稱就跳到定義
+  const modKey = IS_MAC ? 'Meta' : 'Control';
+  addEventListener('keydown', (e) => { if (e.key === modKey) document.body.classList.add('mod-down'); });
+  addEventListener('keyup', (e) => { if (e.key === modKey) document.body.classList.remove('mod-down'); });
+  addEventListener('blur', () => document.body.classList.remove('mod-down'));
+  $('#stage').addEventListener('click', (e) => {
+    if (!mod(e) || e.shiftKey || e.altKey || e.target.tagName !== 'TEXTAREA') return;
+    const t = codeTab();
+    if (!t || e.target !== t.view.ta) return;
+    e.preventDefault();
+    const pos = t.view.ta.selectionStart;
+    t.view.ta.setSelectionRange(pos, pos);
+    goToDefinition(t, pos, { x: e.clientX, y: e.clientY + 14 }).catch(fail);
+  });
+}
+
+/* ───────────── 鍵盤快捷鍵 ───────────── */
+
+/**
+ * 可以修改的快捷鍵：mac／win 是預設值（'Mod' 在 macOS 是 ⌘、其他平台是 Ctrl）。
+ * editor: true 的功能只在游標位於編輯器時有效。
+ */
+const KEY_COMMANDS = [
+  { id: 'save', group: '檔案', title: '儲存', mac: ['Mod+S'], win: ['Mod+S'], run: () => save(activeTab()) },
+  { id: 'saveAs', group: '檔案', title: '另存新檔…', mac: ['Mod+Alt+S'], win: ['Mod+Alt+S'], run: () => save(activeTab(), true) },
+  { id: 'newFile', group: '檔案', title: '新增未命名檔案', mac: ['Mod+N'], win: ['Mod+N'], run: () => newUntitled() },
+  { id: 'openFile', group: '檔案', title: '開啟檔案…', mac: ['Mod+O'], win: ['Mod+O'], run: () => openFileDialog() },
+  { id: 'quickOpen', group: '檔案', title: '搜尋檔名', mac: ['Mod+P'], win: ['Mod+P'], run: () => { setSide('files'); $('#filter').focus(); $('#filter').select(); } },
+  { id: 'find', group: '尋找與取代', title: '尋找', mac: ['Mod+F'], win: ['Mod+F'], run: () => openFind(false) },
+  { id: 'replace', group: '尋找與取代', title: '取代', mac: ['Mod+Alt+F'], win: ['Mod+H', 'Mod+Alt+F'], run: () => openFind(true) },
+  { id: 'findNext', group: '尋找與取代', title: '下一個符合的項目', mac: ['Mod+G', 'F3'], win: ['F3'], run: () => findStep(1) },
+  { id: 'findPrev', group: '尋找與取代', title: '上一個符合的項目', mac: ['Mod+Shift+G', 'Shift+F3'], win: ['Shift+F3'], run: () => findStep(-1) },
+  { id: 'searchProject', group: '尋找與取代', title: '在專案中搜尋', mac: ['Mod+Shift+F'], win: ['Mod+Shift+F'], run: () => openSearch(false) },
+  { id: 'replaceProject', group: '尋找與取代', title: '在專案中取代', mac: ['Mod+Shift+H'], win: ['Mod+Shift+H'], run: () => openSearch(true) },
+  { id: 'gotoLine', group: '前往', title: '前往行…', mac: ['Ctrl+G', 'Mod+L'], win: ['Mod+G', 'Mod+L'], run: () => gotoLine() },
+  { id: 'definition', group: '前往', title: '跳到定義', mac: ['F12'], win: ['F12'], run: () => goToDefinition() },
+  { id: 'references', group: '前往', title: '尋找所有參考', mac: ['Shift+F12'], win: ['Shift+F12'], run: () => referencesAtCaret() },
+  { id: 'navBack', group: '前往', title: '回到上一個位置', mac: ['Ctrl+-'], win: ['Alt+Left'], run: () => navGo(-1) },
+  { id: 'navForward', group: '前往', title: '前往下一個位置', mac: ['Ctrl+Shift+-'], win: ['Alt+Right'], run: () => navGo(1) },
+  { id: 'toggleComment', group: '編輯', title: '切換行註解', mac: ['Mod+/'], win: ['Mod+/'], editor: true, run: () => toggleCommentAtCaret() },
+  { id: 'wordWrap', group: '編輯', title: '切換自動換行', mac: ['Alt+Z'], win: ['Alt+Z'], run: () => td.settings.update('codeEditor.wordWrap', !setting('wordWrap', false)) },
+  { id: 'keybindings', group: '其他', title: '鍵盤快捷鍵', mac: ['Mod+K'], win: ['Mod+K'], run: () => openKeysPanel() },
+];
+const KEY_BY_ID = Object.fromEntries(KEY_COMMANDS.map((c) => [c.id, c]));
+
+/** 不能修改的按鍵（只在面板中列出說明） */
+const FIXED_KEYS = [
+  ['Tab／Shift+Tab', '縮排／取消縮排（有選取多行時整段）'],
+  ['Enter', '換行並延續縮排'],
+  [`${IS_MAC ? '⌘' : 'Ctrl'}＋點擊名稱`, '跳到定義'],
+  ['Esc', '關閉尋找列、選單、定義清單'],
+  ['Enter／Shift+Enter', '尋找列：下一個／上一個'],
+  [`Enter／${IS_MAC ? '⌘' : 'Ctrl'}+Enter`, '尋找列的取代框：取代一個／全部取代'],
+  ['↑↓、Enter、空白鍵、Delete', '專案搜尋結果：瀏覽、開啟、勾選、從清單移除'],
+  ['↑↓、Enter', '定義清單：選擇、開啟'],
+];
+
+const keys = { overrides: {}, map: null, rec: null };
+
+const defaultsOf = (c) => (IS_MAC ? c.mac : c.win).map((k) => C.normalizeCombo(k, IS_MAC));
+const keysOf = (id) => (keys.map && keys.map.keys.get(id)) || [];
+/** 功能目前的第一組快捷鍵（顯示用）；沒有時回傳空字串 */
+const keyLabel = (id) => (keysOf(id)[0] ? C.comboLabel(keysOf(id)[0], IS_MAC) : '');
+
+function loadKeymap(overrides) {
+  keys.overrides = overrides && typeof overrides === 'object' ? overrides : {};
+  keys.map = C.resolveKeymap(KEY_COMMANDS, keys.overrides, IS_MAC);
+  refreshKeyLabels();
+}
+
+/** 畫面上提到快捷鍵的地方：歡迎畫面、選單、提示文字 */
+function refreshKeyLabels() {
+  for (const el of $$('[data-cmd]')) el.textContent = keyLabel(el.dataset.cmd);
+  $('#filter').placeholder = keyLabel('quickOpen') ? `搜尋檔名（${keyLabel('quickOpen')}）` : '搜尋檔名';
+  $('#sQuery').placeholder = keyLabel('searchProject') ? `在專案中搜尋（${keyLabel('searchProject')}）` : '在專案中搜尋';
+  $('#findNext').title = `下一個（Enter${keyLabel('findNext') ? `、${keyLabel('findNext')}` : ''}）`;
+  $('#findPrev').title = `上一個（Shift+Enter${keyLabel('findPrev') ? `、${keyLabel('findPrev')}` : ''}）`;
+  $('#stKeys').title = `鍵盤快捷鍵${keyLabel('keybindings') ? `（${keyLabel('keybindings')}）` : ''}`;
+  const shown = [['quickOpen', 'save'], ['find', 'gotoLine'], ['toggleComment', null], ['searchProject', 'replaceProject'], ['definition', 'navBack'], ['keybindings', null]];
+  const cell = (id) => (id ? `<td>${esc(keyLabel(id) || '—')}</td><td>${esc(KEY_BY_ID[id].title)}</td>` : '<td></td><td></td>');
+  $('#welcomeKeys').innerHTML = shown.map(([a, b]) => `<tr>${cell(a)}${b ? cell(b) : a === 'toggleComment' ? `<td>${IS_MAC ? '⇥ / ⇧⇥' : 'Tab / Shift+Tab'}</td><td>縮排／取消縮排</td>` : cell(null)}</tr>`).join('');
+}
+
+/** 全域快捷鍵：找到對應的功能就執行 */
+function dispatchKey(e) {
+  if (e.isComposing || e.keyCode === 229) return false;
+  const combo = C.comboFromEvent(e);
+  const id = combo && keys.map && keys.map.index.get(combo);
+  if (!id) return false;
+  const c = KEY_BY_ID[id];
+  if (c.editor) {
+    const t = codeTab();
+    if (!t || document.activeElement !== t.view.ta) return false;
+  }
+  e.preventDefault();
+  Promise.resolve(c.run()).catch(fail);
+  return true;
+}
+
+function toggleCommentAtCaret() {
+  const t = codeTab();
+  if (!t || t.view.ta.readOnly) return;
+  const ta = t.view.ta;
+  const tok = C.lineComment(t.lang);
+  if (!tok) { notice(`${C.LANG_NAME[t.lang] || t.lang} 沒有行註解`); return; }
+  applyEdit(t.view, C.toggleComment(ta.value, ta.selectionStart, ta.selectionEnd, tok));
+}
+
+function referencesAtCaret() {
+  const t = codeTab();
+  if (!t) return;
+  const w = C.wordAt(t.view.ta.value, t.view.ta.selectionStart, t.lang);
+  if (w) findReferences(w.name, t); else notice('游標不在名稱上');
+}
+
+/* 面板 */
+
+function openKeysPanel() {
+  closeMenus();
+  $('#keysPanel').hidden = false;
+  $('#keysFilter').value = '';
+  renderKeysPanel();
+  $('#keysFilter').focus();
+}
+
+function closeKeysPanel() {
+  stopRecording();
+  $('#keysPanel').hidden = true;
+  const t = codeTab();
+  if (t) t.view.focus();
+}
+
+const kbd = (combo) => `<kbd>${esc(C.comboLabel(combo, IS_MAC))}</kbd>`;
+
+function renderKeysPanel() {
+  const q = $('#keysFilter').value.trim().toLowerCase();
+  const byKey = keys.filterCombo || null;
+  const match = (c) => {
+    if (byKey) return keysOf(c.id).includes(byKey);
+    if (!q) return true;
+    return c.title.toLowerCase().includes(q) || c.group.includes(q) || keysOf(c.id).some((k) => C.comboLabel(k, IS_MAC).toLowerCase().includes(q) || k.toLowerCase().includes(q));
+  };
+  const rows = [];
+  let group = '';
+  for (const c of KEY_COMMANDS.filter(match)) {
+    if (c.group !== group) { group = c.group; rows.push(`<div class="kgrp">${esc(group)}</div>`); }
+    const list = keysOf(c.id);
+    const custom = keys.map.custom.has(c.id) && !C.sameKeys(list, defaultsOf(c));
+    const rec = keys.rec && keys.rec.id === c.id;
+    const chips = rec
+      ? `<span class="krec">${esc(keys.rec.msg || '請按下新的組合鍵…（Esc 取消）')}</span>`
+      : list.length ? list.map((k) => `<span class="kchip">${kbd(k)}<button class="kx" data-kact="remove" data-key="${esc(k)}" title="移除這組快捷鍵">✕</button></span>`).join('') : '<span class="knone">（未設定）</span>';
+    rows.push(`<div class="krow${custom ? ' custom' : ''}${rec ? ' rec' : ''}" data-id="${c.id}">`
+      + `<span class="kt">${esc(c.title)}${c.editor ? '<span class="kwhen">編輯器中</span>' : ''}</span>`
+      + `<span class="kk">${chips}</span>`
+      + `<span class="ka"><button class="ib sm" data-kact="edit" title="修改（改成一組新的快捷鍵）">✎</button><button class="ib sm" data-kact="add" title="再加一組快捷鍵">＋</button>`
+      + `${custom ? '<button class="ib sm" data-kact="reset" title="還原預設">↺</button>' : ''}</span>`
+      + `${custom ? `<span class="kdef">預設：${defaultsOf(c).map((k) => esc(C.comboLabel(k, IS_MAC))).join('、') || '（未設定）'}</span>` : ''}</div>`);
+  }
+  if (!byKey && !q) {
+    rows.push('<div class="kgrp">固定的按鍵（不能修改）</div>');
+    for (const [k, d] of FIXED_KEYS) rows.push(`<div class="krow fixed"><span class="kt">${esc(d)}</span><span class="kk"><kbd>${esc(k)}</kbd></span></div>`);
+  }
+  $('#keysBody').innerHTML = rows.join('') || `<div class="empty-msg">${byKey ? `${esc(C.comboLabel(byKey, IS_MAC))} 沒有指定給任何功能` : '找不到符合的功能'}</div>`;
+  const n = Object.keys(keys.overrides).length;
+  $('#keysResetAll').disabled = !n;
+  $('#keysByKey').classList.toggle('on', !!byKey || (keys.rec && keys.rec.id === '*'));
+  $('#keysByKey').textContent = byKey ? `按鍵：${C.comboLabel(byKey, IS_MAC)} ✕` : keys.rec && keys.rec.id === '*' ? '請按下要查的按鍵…' : '⌨ 以按鍵查詢';
+  if (keys.map.conflicts.length) {
+    const [k, a, b] = keys.map.conflicts[0];
+    $('#keysNote').textContent = `注意：${C.comboLabel(k, IS_MAC)} 同時指定給「${KEY_BY_ID[a].title}」與「${KEY_BY_ID[b].title}」，目前由「${KEY_BY_ID[a].title}」使用`;
+  } else {
+    $('#keysNote').textContent = `修改後立即生效並自動儲存。ToolDock 選單使用的按鍵（例如 ${IS_MAC ? '⌘W、⇧⌘S、⌘H' : 'Ctrl+W、Ctrl+Shift+S'}）不能使用。`;
+  }
+}
+
+/** 開始錄製：mode = 'edit'（取代）| 'add'（新增）；id = '*' 表示以按鍵查詢 */
+function startRecording(id, mode) {
+  stopRecording();
+  keys.rec = { id, mode, msg: '' };
+  addEventListener('keydown', onRecordKey, true);
+  renderKeysPanel();
+}
+
+function stopRecording() {
+  if (!keys.rec) return;
+  keys.rec = null;
+  removeEventListener('keydown', onRecordKey, true);
+}
+
+function onRecordKey(e) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.isComposing) return;
+  if (e.key === 'Escape' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) { stopRecording(); renderKeysPanel(); return; }
+  const combo = C.comboFromEvent(e);
+  if (!combo) return; // 只按了修飾鍵，繼續等
+  const rec = keys.rec;
+  if (rec.id === '*') { stopRecording(); keys.filterCombo = combo; renderKeysPanel(); return; }
+  const why = C.comboProblem(combo, IS_MAC);
+  if (why) { rec.msg = `${C.comboLabel(combo, IS_MAC)}：${why}。請改按其他組合鍵（Esc 取消）`; renderKeysPanel(); return; }
+  stopRecording();
+  assignKey(rec.id, combo, rec.mode).catch(fail);
+}
+
+/** 指定快捷鍵；被其他功能使用時先確認 */
+async function assignKey(id, combo, mode) {
+  const owner = keys.map.index.get(combo);
+  if (owner && owner !== id) {
+    const r = await td.dialog.message({
+      type: 'question',
+      message: `${C.comboLabel(combo, IS_MAC)} 已經是「${KEY_BY_ID[owner].title}」的快捷鍵`,
+      detail: `要改給「${KEY_BY_ID[id].title}」嗎？「${KEY_BY_ID[owner].title}」會移除這組快捷鍵。`,
+      buttons: ['改用', '取消'], defaultId: 0, cancelId: 1,
+    });
+    if (r.response !== 0) { renderKeysPanel(); return; }
+    setKeys(owner, keysOf(owner).filter((k) => k !== combo));
+  }
+  const cur = keysOf(id);
+  setKeys(id, mode === 'add' ? [...cur.filter((k) => k !== combo), combo] : [combo]);
+  await saveKeymap();
+  notice(`「${KEY_BY_ID[id].title}」：${C.comboLabel(combo, IS_MAC)}`);
+}
+
+/** 設定某個功能的快捷鍵（和預設相同時移除自訂） */
+function setKeys(id, list) {
+  if (C.sameKeys(list, defaultsOf(KEY_BY_ID[id]))) delete keys.overrides[id];
+  else keys.overrides[id] = list;
+  keys.map = C.resolveKeymap(KEY_COMMANDS, keys.overrides, IS_MAC);
+}
+
+async function saveKeymap() {
+  refreshKeyLabels();
+  if (!$('#keysPanel').hidden) renderKeysPanel();
+  try { await td.invoke('setKeybindings', keys.overrides); } catch (err) { fail(err); }
+}
+
+function bindKeysPanel() {
+  $('#keysClose').onclick = closeKeysPanel;
+  $('#keysPanel').addEventListener('mousedown', (e) => { if (e.target.id === 'keysPanel') closeKeysPanel(); });
+  $('#keysFilter').addEventListener('input', () => { keys.filterCombo = null; renderKeysPanel(); });
+  $('#keysByKey').onclick = () => {
+    if (keys.filterCombo || (keys.rec && keys.rec.id === '*')) { stopRecording(); keys.filterCombo = null; renderKeysPanel(); return; }
+    $('#keysFilter').value = '';
+    startRecording('*');
+  };
+  $('#keysResetAll').onclick = async () => {
+    const r = await td.dialog.message({ type: 'question', message: '要把所有快捷鍵還原成預設嗎？', buttons: ['全部還原', '取消'], defaultId: 1, cancelId: 1 });
+    if (r.response !== 0) return;
+    keys.overrides = {};
+    keys.map = C.resolveKeymap(KEY_COMMANDS, keys.overrides, IS_MAC);
+    await saveKeymap();
+    notice('已還原所有快捷鍵');
+  };
+  $('#keysBody').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-kact]');
+    const row = e.target.closest('.krow[data-id]');
+    if (!b || !row) return;
+    const id = row.dataset.id;
+    const act = b.dataset.kact;
+    if (act === 'edit' || act === 'add') startRecording(id, act);
+    else if (act === 'remove') { setKeys(id, keysOf(id).filter((k) => k !== b.dataset.key)); saveKeymap(); }
+    else if (act === 'reset') { setKeys(id, defaultsOf(KEY_BY_ID[id])); saveKeymap(); }
+  });
+  $('#keysBody').addEventListener('dblclick', (e) => {
+    const row = e.target.closest('.krow[data-id]');
+    if (row && !e.target.closest('[data-kact]')) startRecording(row.dataset.id, 'edit');
+  });
+}
+
 /* ───────────── 快捷鍵與事件 ───────────── */
 
 async function gotoLine() {
@@ -2182,26 +2654,17 @@ async function gotoLine() {
 }
 
 function onKeyDown(e) {
-  const mod = IS_MAC ? e.metaKey : e.ctrlKey;
-  const k = e.key.toLowerCase();
-  if (!$('#modal').hidden) return;
+  if (!$('#modal').hidden || keys.rec) return;
+  if (!$('#keysPanel').hidden) {
+    if (e.key === 'Escape') { e.preventDefault(); closeKeysPanel(); }
+    return;
+  }
   if (e.key === 'Escape') {
     closeMenus();
     if (st.find.open) { e.preventDefault(); closeFind(); }
     return;
   }
-  if (e.key === 'F3' || (IS_MAC && mod && k === 'g' && !e.ctrlKey)) { e.preventDefault(); findStep(e.shiftKey ? -1 : 1); return; }
-  if (e.ctrlKey && !e.metaKey && k === 'g') { e.preventDefault(); gotoLine(); return; }
-  if (!mod) return;
-  if (k === 's') { e.preventDefault(); save(activeTab(), e.shiftKey || e.altKey); }
-  else if (e.shiftKey && k === 'f') { e.preventDefault(); openSearch(false); }
-  else if (e.shiftKey && k === 'h') { e.preventDefault(); openSearch(true); }
-  else if (k === 'f' && !e.altKey) { e.preventDefault(); openFind(false); }
-  else if (k === 'h' || (k === 'f' && e.altKey)) { e.preventDefault(); openFind(true); }
-  else if (k === 'p') { e.preventDefault(); setSide('files'); $('#filter').focus(); $('#filter').select(); }
-  else if (k === 'n') { e.preventDefault(); newUntitled(); }
-  else if (k === 'o') { e.preventDefault(); openFileDialog().catch(fail); }
-  else if (k === 'l' && !e.shiftKey && !e.altKey) { e.preventDefault(); gotoLine(); }
+  dispatchKey(e);
 }
 
 /** 側欄寬度拖曳 */
@@ -2244,6 +2707,7 @@ const ACTIONS = {
   refresh: () => refreshAll(),
   refreshGit: () => refreshGit(),
   collapse: () => { st.tree.expanded.clear(); renderTree(); saveStateSoon(); },
+  keybindings: () => openKeysPanel(),
 };
 
 async function runCommand(cmd) {
@@ -2251,6 +2715,7 @@ async function runCommand(cmd) {
   else if (cmd === 'openFile') await openFileDialog();
   else if (cmd === 'showChanges') { setSide('git'); await refreshGit(); }
   else if (cmd === 'search') openSearch(false);
+  else if (cmd === 'keybindings') openKeysPanel();
 }
 
 async function drainPending() {
@@ -2421,6 +2886,7 @@ function bind() {
   };
   $('#stWrap').onclick = () => td.settings.update('codeEditor.wordWrap', !setting('wordWrap', false)).catch(fail);
   $('#stIndent').onclick = () => td.settings.update('codeEditor.insertSpaces', !setting('insertSpaces', true)).catch(fail);
+  $('#stKeys').onclick = () => openKeysPanel();
 
   addEventListener('focus', onWindowFocus);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) onWindowFocus(); });
@@ -2436,13 +2902,15 @@ function bind() {
 const mod = (e) => (IS_MAC ? e.metaKey : e.ctrlKey);
 
 async function init() {
-  for (const k of $$('[data-key]')) k.textContent = `${MOD}${k.dataset.key}`;
   st.diffMode = store.get('diffMode', 'sbs');
   initSplitter();
   bind();
   bindSearch();
+  bindDefinitions();
+  bindKeysPanel();
   loadSearchPrefs();
   st.info = await td.invoke('info');
+  loadKeymap(st.info.keybindings);
   st.projects = st.info.projects;
   applySettings();
   renderRecent();

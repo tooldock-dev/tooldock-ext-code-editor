@@ -9,6 +9,8 @@ const crypto = require('crypto');
 const files = require('./files');
 const git = require('./git');
 const search = require('./search');
+const symbols = require('./symbols');
+const decompiler = require('./decompile');
 const edits = require('./edits');
 
 let ctx = null;
@@ -20,6 +22,7 @@ const setting = (k, d) => {
 };
 const exclude = () => setting('exclude', 'node_modules, .git, .svn, .hg, .DS_Store, Thumbs.db, __pycache__');
 const gitPath = () => setting('gitPath', '') || undefined;
+const javaPath = () => String(setting('javaPath', '') || '').trim();
 
 /* ───────────── 專案 ───────────── */
 
@@ -60,6 +63,8 @@ function renameProject({ id, name }) {
 }
 
 function removeProject(id) {
+  const gone = projects().find((p) => p.id === id);
+  if (gone) symbols.forget(gone.root);
   const next = projects().filter((p) => p.id !== id);
   ctx.storage.set('projects', next);
   ctx.storage.delete(`state:${id}`);
@@ -81,6 +86,7 @@ exports.activate = (context) => {
       lastProject: last,
       state: last ? ctx.storage.get(`state:${last}`, null) : null,
       recent: ctx.storage.get('recent', []),
+      keybindings: ctx.storage.get('keybindings', {}),
       platform: ctx.platform.version,
       sep: path.sep,
     };
@@ -121,6 +127,18 @@ exports.activate = (context) => {
   });
   h('reveal', (file) => ctx.shell.showItemInFolder(file));
 
+  // 自訂快捷鍵：{ 功能 id: [組合鍵…] }，只存和預設不同的
+  h('setKeybindings', (map) => {
+    const clean = {};
+    if (map && typeof map === 'object') {
+      for (const [id, list] of Object.entries(map)) {
+        if (/^[\w.-]{1,64}$/.test(id) && Array.isArray(list)) clean[id] = list.filter((k) => typeof k === 'string' && k.length <= 64).slice(0, 8);
+      }
+    }
+    ctx.storage.set('keybindings', clean);
+    return clean;
+  });
+
   // Git
   h('gitStatus', (id) => git.status(project(id).root, gitPath()));
   h('gitDiff', async ({ id, top, area, path: rel, orig }) => {
@@ -151,6 +169,19 @@ exports.activate = (context) => {
     return done(op, { results });
   });
   h('undo', (undoId) => edits.undo(undoId));
+
+  // 跳到定義（符號索引）
+  h('definitions', ({ id, ...o }) => symbols.definitions(project(id).root, exclude(), o));
+
+  // .class 反編譯：回傳和 read 相同形狀的文件（唯讀）
+  h('decompile', async (file) => {
+    const st = fs.statSync(file);
+    const r = await decompiler.decompile(file, { javaPath: javaPath() });
+    return {
+      file, name: path.basename(file), size: st.size, mtime: st.mtimeMs,
+      text: r.text, eol: '\n', bom: false, encoding: 'utf8', readOnly: true, decompiled: r.engine, note: r.note,
+    };
+  });
 
   // Git 還原與檔案歷史
   h('gitRestore', async ({ id, top, items }) => {
@@ -197,6 +228,7 @@ exports.activate = (context) => {
     ctx.commands.register('codeEditor.openFile', () => toView('openFile')),
     ctx.commands.register('codeEditor.showChanges', () => toView('showChanges')),
     ctx.commands.register('codeEditor.search', () => toView('search')),
+    ctx.commands.register('codeEditor.keybindings', () => toView('keybindings')),
     ctx.settings.onDidChange((key) => ctx.ui.emit('settingsChanged', { key, settings: ctx.settings.all() })),
   );
 };

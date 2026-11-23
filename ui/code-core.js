@@ -521,10 +521,400 @@
     return (rel) => (!inc.length || inc.some((r) => r.test(rel))) && !exc.some((r) => r.test(rel));
   }
 
+  /* ───────────── 符號（跳到定義） ───────────── */
+
+  /**
+   * 不分析型別，只用各語言的定義寫法（function、class、def、方法簽章…）找出「名稱在哪裡被定義」。
+   * 同名的定義可能有很多個，由 rankDefinitions 依 import、同檔案、同資料夾、同語言排序。
+   */
+  const ID = '[A-Za-z_$][\\w$]*';
+  const N = `(${ID})`;
+  const JMODS = '(?:(?:public|private|protected|internal|static|final|abstract|synchronized|native|virtual|override|async|sealed|partial|extern|unsafe|new|default|strictfp|transient|volatile|readonly|const|open|inline|suspend|operator|infix|tailrec|data|inner|lateinit|implicit|lazy)\\s+)';
+  const JTYPE = '([\\w$.]+(?:<[^;(){}=]*?>)?(?:\\[\\])*\\??)';
+  const NOT_NAME = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'do', 'else', 'new', 'throw', 'typeof', 'sizeof', 'using', 'lock', 'with', 'await', 'yield', 'delete', 'in', 'of', 'super', 'this', 'foreach', 'elseif', 'elif', 'until', 'unless']);
+  const NOT_TYPE = new Set(['return', 'new', 'else', 'throw', 'await', 'case', 'goto', 'yield', 'if', 'for', 'while', 'switch', 'catch', 'do', 'using', 'lock', 'delete', 'typeof', 'sizeof', 'in', 'of', 'is', 'as', 'echo', 'print', 'not', 'and', 'or', 'instanceof', 'import', 'package', 'export', 'from', 'assert', 'raise', 'with', 'when', 'match', 'var', 'val', 'let', 'const']);
+
+  const MODIFIER = /^(?:public|private|protected|internal)$/;
+  const rule = (src, kind, opts = {}) => ({ re: new RegExp(src, opts.ci ? 'gimd' : 'gmd'), kind, type: opts.type });
+
+  const RULES_JS = [
+    rule(`^[ \\t]*(?:export\\s+)?(?:default\\s+)?(?:declare\\s+)?(?:async\\s+)?function\\s*\\*?\\s*${N}`, '函式'),
+    rule(`\\bclass\\s+${N}`, '類別'),
+    rule(`^[ \\t]*(?:export\\s+)?(?:declare\\s+)?(?:const|let|var)\\s+${N}\\s*(?::[^=\\n]+)?=`, '變數'),
+    rule(`^[ \\t]*(?:export\\s+)?(?:declare\\s+)?(?:abstract\\s+)?(?:interface|type|enum|namespace)\\s+${N}`, '型別'),
+    rule(`^[ \\t]*(?:(?:public|private|protected|static|async|get|set|readonly|override|abstract|declare)\\s+)*\\*?\\s*#?${N}\\s*(?:<[^>()\\n]*>)?\\s*\\([^()\\n]*(?:\\([^()\\n]*\\)[^()\\n]*)*\\)\\s*(?::\\s*[^{;=\\n]+)?\\{`, '方法'),
+    rule(`^[ \\t]*(?:(?:public|private|protected|static|readonly|override|declare)\\s+)*#?${N}\\s*[?!]?\\s*(?::[^=;\\n]+)?=\\s*(?:async\\s*)?(?:function\\b|\\([^)\\n]*\\)\\s*(?::[^=\\n]+)?=>|${ID}\\s*=>)`, '方法'),
+    rule(`^[ \\t]*${N}\\s*:\\s*(?:async\\s*)?(?:function\\b|\\([^)\\n]*\\)\\s*=>)`, '方法'),
+    rule(`\\b(?:module\\.)?exports\\.${N}\\s*=(?!=)`, '匯出'),
+  ];
+
+  const RULES_JVM = [
+    rule(`\\b(?:class|interface|enum|record|struct|object|trait|@interface)\\s+${N}`, '類別'),
+    rule(`^[ \\t]*${JMODS}*(?:<[^>\\n]*>\\s+)?${JTYPE}\\s+${N}\\s*\\(`, '方法', { type: 1 }),
+    rule(`^[ \\t]*(?:@\\w+(?:\\([^)\\n]*\\))?\\s+)*(?:public|private|protected)\\s+${N}\\s*\\(`, '建構子'),
+    rule(`^[ \\t]*(?:@\\w+(?:\\([^)\\n]*\\))?\\s+)*${JMODS}+${JTYPE}\\s+${N}\\s*(?:[=;,]|\\{|=>|$)`, '欄位', { type: 1 }),
+    rule(`\\bfun\\s+(?:<[^>\\n]*>\\s*)?(?:${ID}\\.)*${N}\\s*[(<]`, '函式'),
+    rule(`^[ \\t]*${JMODS}*(?:val|var)\\s+${N}\\b`, '屬性'),
+    rule(`\\bdef\\s+${N}`, '方法'),
+    rule(`\\b(?:namespace|delegate\\s+[\\w<>.]+)\\s+${N}`, '型別'),
+  ];
+
+  const RULES_C = [
+    rule(`^(?:[\\w$:<>,]+[ \\t*&]+)+(?:${ID}::)*~?${N}\\s*\\([^;\\n]*$`, '函式', { type: 'line' }),
+    rule(`^[ \\t]*#[ \\t]*define\\s+${N}`, '巨集'),
+    rule(`\\b(?:struct|class|union|enum(?:\\s+class)?|namespace)\\s+${N}\\b(?!\\s*;)`, '型別'),
+    rule(`\\btypedef\\b[^;{]*?\\b${N}\\s*;`, '型別'),
+    rule(`@(?:interface|implementation|protocol)\\s+${N}`, '類別'),
+    rule(`^[-+]\\s*\\([^)\\n]*\\)\\s*${N}`, '方法'),
+  ];
+
+  const RULES = {
+    js: RULES_JS,
+    jvm: RULES_JVM,
+    cs: RULES_JVM,
+    dart: [...RULES_JVM, rule(`\\b(?:mixin|extension|typedef)\\s+${N}`, '型別')],
+    c: RULES_C,
+    py: [
+      rule(`^[ \\t]*(?:async\\s+)?def\\s+${N}`, '函式'),
+      rule(`^[ \\t]*class\\s+${N}`, '類別'),
+      rule(`^${N}\\s*(?::[^=\\n]+)?=(?!=)`, '變數'),
+      rule(`\\bself\\.${N}\\s*(?::[^=\\n]+)?=(?!=)`, '屬性'),
+    ],
+    go: [
+      rule(`^func\\s+(?:\\([^)\\n]*\\)\\s*)?${N}`, '函式'),
+      rule(`^[ \\t]*type\\s+${N}`, '型別'),
+      rule(`^\\t${N}\\s+(?:struct|interface)\\b`, '型別'),
+      rule(`^(?:var|const)\\s+${N}`, '變數'),
+    ],
+    rs: [
+      rule(`\\bfn\\s+${N}`, '函式'),
+      rule(`\\b(?:struct|enum|trait|type|mod|union)\\s+${N}`, '型別'),
+      rule(`\\b(?:const|static)\\s+(?:mut\\s+)?${N}\\s*:`, '常數'),
+      rule(`\\bmacro_rules!\\s*${N}`, '巨集'),
+    ],
+    php: [
+      rule('\\bfunction\\s+&?([A-Za-z_]\\w*)', '函式'),
+      rule('\\b(?:class|interface|trait|enum)\\s+([A-Za-z_]\\w*)', '類別'),
+      rule('\\b(?:public|private|protected|var)\\s+(?:static\\s+)?(?:readonly\\s+)?(?:\\??[\\w\\\\]+\\s+)?\\$([A-Za-z_]\\w*)', '屬性'),
+      rule('\\bconst\\s+([A-Za-z_]\\w*)\\s*=', '常數'),
+      rule('\\bdefine\\(\\s*[\'"]([A-Za-z_]\\w*)[\'"]', '常數'),
+    ],
+    rb: [
+      rule('\\bdef\\s+(?:self\\.)?([A-Za-z_]\\w*[?!=]?)', '方法'),
+      rule('\\b(?:class|module)\\s+(?:\\w+::)*([A-Z]\\w*)', '類別'),
+    ],
+    sql: [
+      rule('\\b(?:procedure|function|package(?:\\s+body)?|view|table|trigger|type(?:\\s+body)?|sequence|synonym|materialized\\s+view)\\s+(?:(?:"[^"\\n]+"|\\w+)\\.)?"?([A-Za-z_][\\w$#]*)"?', '物件', { ci: true }),
+    ],
+    sh: [
+      rule('^[ \\t]*(?:function\\s+)?([A-Za-z_][\\w-]*)\\s*\\(\\s*\\)', '函式'),
+      rule('^[ \\t]*function\\s+([A-Za-z_][\\w-]*)', '函式'),
+      rule('^[ \\t]*(?:export\\s+|local\\s+|readonly\\s+|declare\\s+(?:-\\w+\\s+)?)?([A-Za-z_]\\w*)=', '變數'),
+    ],
+    lua: [
+      rule(`\\bfunction\\s+(?:[\\w.]+[.:])?${N}`, '函式'),
+      rule(`^[ \\t]*local\\s+${N}\\s*=`, '變數'),
+    ],
+    swift: [
+      rule(`\\bfunc\\s+${N}`, '函式'),
+      rule(`\\b(?:class|struct|enum|protocol|extension|actor|typealias)\\s+${N}`, '型別'),
+      rule(`^[ \\t]*(?:(?:public|private|fileprivate|internal|open|static|final|lazy|weak|override)\\s+)*(?:let|var)\\s+${N}`, '屬性'),
+    ],
+    perl: [rule(`\\bsub\\s+${N}`, '函式'), rule('\\bpackage\\s+([\\w:]+)', '套件')],
+    ps: [rule('\\bfunction\\s+([\\w-]+)', '函式', { ci: true }), rule(`\\bclass\\s+${N}`, '類別', { ci: true })],
+    vb: [rule(`\\b(?:Sub|Function|Property|Class|Module|Structure|Interface|Enum)\\s+${N}`, '定義', { ci: true })],
+  };
+
+  /** 語言 → 語言群組（同一群組的檔案可以互相參照） */
+  const FAMILY = {
+    javascript: 'js', typescript: 'js', java: 'jvm', kotlin: 'jvm', scala: 'jvm', groovy: 'jvm', gradle: 'jvm',
+    csharp: 'cs', dart: 'dart', c: 'c', cpp: 'c', objectivec: 'c', python: 'py', go: 'go', rust: 'rs', php: 'php',
+    ruby: 'rb', sql: 'sql', bash: 'sh', lua: 'lua', swift: 'swift', perl: 'perl', powershell: 'ps', vbnet: 'vb', vbscript: 'vb',
+  };
+  const symbolFamily = (lang) => FAMILY[lang] || null;
+  /** 名稱不分大小寫的語言 */
+  const symbolCaseInsensitive = (lang) => ['sql', 'vb', 'ps'].includes(FAMILY[lang]);
+
+  /** 每行開頭的位置（行號查詢用） */
+  function lineStarts(text) {
+    const out = [0];
+    for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) out.push(i + 1);
+    return out;
+  }
+  function lineOf(starts, pos) {
+    let lo = 0, hi = starts.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid] <= pos) lo = mid; else hi = mid - 1; }
+    return lo;
+  }
+
+  /** 第一個型別字是不是關鍵字（return foo(…)、new Foo(…) 不是定義） */
+  function badType(type) {
+    const first = String(type || '').trim().split(/[\s.<[]/)[0];
+    return NOT_TYPE.has(first);
+  }
+
+  /**
+   * 文字中的定義：[{ name, kind, line, col（從 1 起算）, text（那一行，去掉前後空白，最多 160 字） }]
+   * 不支援的語言回傳空陣列。
+   */
+  function symbolsIn(text, lang) {
+    const rules = RULES[FAMILY[lang]];
+    if (!rules || !text) return [];
+    const starts = lineStarts(text);
+    const seen = new Set();
+    const out = [];
+    for (const r of rules) {
+      r.re.lastIndex = 0;
+      let m;
+      while ((m = r.re.exec(text))) {
+        if (m[0] === '') { r.re.lastIndex++; continue; }
+        const gi = m.length - 1; // 名稱一律是最後一個群組
+        const name = m[gi];
+        if (!name || !m.indices[gi]) continue;
+        if (NOT_NAME.has(name)) continue;
+        if (r.type === 1 && badType(m[1])) continue;
+        const kind = r.type === 1 && MODIFIER.test(m[1]) ? '建構子' : r.kind; // public Foo(…)
+        if (r.type === 'line' && badType(m[0])) continue;
+        const pos = m.indices[gi][0];
+        const ln = lineOf(starts, pos);
+        const key = `${ln}:${pos}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const le = text.indexOf('\n', starts[ln]);
+        const line = text.slice(starts[ln], le < 0 ? text.length : le).trim();
+        out.push({ name, kind, line: ln + 1, col: pos - starts[ln] + 1, text: line.length > 160 ? `${line.slice(0, 160)}…` : line });
+      }
+    }
+    return out.sort((a, b) => a.line - b.line || a.col - b.col);
+  }
+
+  /** 游標所在的名稱：{ name, start, end }；不在名稱上時回傳 null */
+  function wordAt(text, pos, lang) {
+    const fam = FAMILY[lang];
+    const ch = fam === 'sh' || fam === 'ps' ? /[\w-]/ : fam === 'php' ? /\w/ : /[\w$]/;
+    let s = pos, e = pos;
+    while (s > 0 && ch.test(text[s - 1])) s--;
+    while (e < text.length && ch.test(text[e])) e++;
+    if (fam === 'rb' && (text[e] === '?' || text[e] === '!')) e++;
+    if (s === e) return null;
+    const name = text.slice(s, e);
+    if (/^\d/.test(name)) return null;
+    return { name, start: s, end: e };
+  }
+
+  /** 正規化相對路徑（a/./b/../c → a/c） */
+  function joinPath(dir, rel) {
+    const parts = (dir ? dir.split('/') : []).concat(rel.split('/'));
+    const out = [];
+    for (const p of parts) {
+      if (!p || p === '.') continue;
+      if (p === '..') out.pop(); else out.push(p);
+    }
+    return out.join('/');
+  }
+
+  /**
+   * 從目前檔案的 import／require 猜名稱來自哪個檔案：回傳路徑（不含副檔名）陣列。
+   *   JS／TS：import { name } from './x'、const { name } = require('./x')（只處理相對路徑）
+   *   Python：from a.b import name、from .x import name
+   *   Java 類：import a.b.Name;
+   */
+  function importHints(text, name, lang, fileRel) {
+    const fam = FAMILY[lang];
+    const dir = fileRel && fileRel.includes('/') ? fileRel.slice(0, fileRel.lastIndexOf('/')) : '';
+    const has = (s) => new RegExp(`(^|[^\\w$])${name.replace(/[$]/g, '\\$')}([^\\w$]|$)`).test(s);
+    const out = [];
+    let m;
+    if (fam === 'js') {
+      const re = /\bimport\s+([^;]*?)\s+from\s+['"]([^'"]+)['"]|(?:const|let|var)\s+([^=;]+?)=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g;
+      while ((m = re.exec(text))) {
+        const names = m[1] || m[3];
+        const spec = m[2] || m[4];
+        if (spec.startsWith('.') && has(names)) out.push(joinPath(dir, spec).replace(/\.(m?[jt]sx?|cjs|mjs)$/, ''));
+      }
+    } else if (fam === 'py') {
+      const re = /^[ \t]*from\s+(\.*)([\w.]*)\s+import\s+([^\n#]+)/gm;
+      while ((m = re.exec(text))) {
+        if (!has(m[3])) continue;
+        const mod = m[2].split('.').filter(Boolean).join('/');
+        if (m[1]) {
+          let base = dir;
+          for (let i = 1; i < m[1].length; i++) base = base.includes('/') ? base.slice(0, base.lastIndexOf('/')) : '';
+          out.push(joinPath(base, mod || '__init__'));
+        } else out.push(mod);
+      }
+    } else if (fam === 'jvm' || fam === 'cs' || fam === 'dart') {
+      const re = /^[ \t]*import\s+(?:static\s+)?([\w.]+)\.(\w+)\s*;?/gm;
+      while ((m = re.exec(text))) {
+        if (m[2] === name) out.push(m[1].split('.').concat(name).join('/'));
+        else if (m[1].split('.').pop() === name) out.push(m[1].split('.').join('/')); // import static a.b.Cls.member
+      }
+    }
+    return out;
+  }
+
+  const stripExt = (rel) => rel.replace(/\.[^./]+$/, '');
+
+  /**
+   * 排序候選的定義（items: [{ rel, line, col, family }]），回傳 [{ ...item, score }]，score 越小越可能：
+   *   0 來自 import 的檔案　1 同一個檔案　2 同語言、同資料夾　3 同語言　4 其他語言
+   * 游標正好在定義本身時（self）排除那一筆。
+   */
+  function rankDefinitions(items, { rel, family, hints = [], self = null }) {
+    const dir = rel && rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+    const hinted = (r) => {
+      const p = stripExt(r);
+      return hints.some((h) => p === h || p.endsWith(`/${h}`) || p === `${h}/index` || p === `${h}/__init__` || p.endsWith(`/${h}/index`));
+    };
+    return items
+      .filter((it) => !(self && it.rel === self.rel && it.line === self.line && it.col <= self.col && self.col <= it.col + it.name.length))
+      .map((it) => {
+        const itDir = it.rel.includes('/') ? it.rel.slice(0, it.rel.lastIndexOf('/')) : '';
+        let score = 4;
+        if (hints.length && hinted(it.rel)) score = 0;
+        else if (it.rel === rel) score = 1;
+        else if (family && it.family === family && itDir === dir) score = 2;
+        else if (family && it.family === family) score = 3;
+        return { ...it, score };
+      })
+      .sort((a, b) => a.score - b.score || (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0) || a.line - b.line);
+  }
+
+  /* ───────────── 快捷鍵 ───────────── */
+
+  /**
+   * 組合鍵的字串格式：修飾鍵依 Ctrl、Alt、Shift、Meta 的順序，加上按鍵，例如 'Meta+Shift+F'、'Ctrl+-'、'F12'。
+   * 按鍵依實體位置（KeyboardEvent.code）判斷，不受輸入法與 Shift 影響（Shift+- 仍是 '-'）。
+   */
+  const MOD_ORDER = ['Ctrl', 'Alt', 'Shift', 'Meta'];
+  const CODE_KEY = {
+    Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Backslash: '\\', Semicolon: ';', Quote: "'",
+    Comma: ',', Period: '.', Slash: '/', Backquote: '`', IntlBackslash: '\\', Space: 'Space', Enter: 'Enter', NumpadEnter: 'Enter',
+    Tab: 'Tab', Escape: 'Escape', Backspace: 'Backspace', Delete: 'Delete', Insert: 'Insert', Home: 'Home', End: 'End',
+    PageUp: 'PageUp', PageDown: 'PageDown', ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up', ArrowDown: 'Down',
+    NumpadAdd: '+', NumpadSubtract: '-', NumpadMultiply: '*', NumpadDivide: '/', NumpadDecimal: '.',
+  };
+  const MODIFIER_CODES = /^(Shift|Control|Alt|Meta|OS|CapsLock|Fn)(Left|Right)?$/;
+
+  /** KeyboardEvent（或同樣欄位的物件）→ 組合鍵字串；只按修飾鍵或認不出的鍵時回傳 null */
+  function comboFromEvent(e) {
+    const code = e.code || '';
+    if (!code || MODIFIER_CODES.test(code)) return null;
+    let key = CODE_KEY[code];
+    if (!key) {
+      let m;
+      if ((m = code.match(/^Key([A-Z])$/))) key = m[1];
+      else if ((m = code.match(/^(?:Digit|Numpad)(\d)$/))) key = m[1];
+      else if (/^F\d{1,2}$/.test(code)) key = code;
+      else return null;
+    }
+    const mods = [];
+    if (e.ctrlKey) mods.push('Ctrl');
+    if (e.altKey) mods.push('Alt');
+    if (e.shiftKey) mods.push('Shift');
+    if (e.metaKey) mods.push('Meta');
+    return [...mods, key].join('+');
+  }
+
+  /** 整理成標準順序；'Mod' 代表 macOS 的 Meta、其他平台的 Ctrl */
+  function normalizeCombo(combo, mac) {
+    const parts = String(combo || '').split('+');
+    // 按鍵本身是 '+' 時（例如 'Ctrl++'）
+    let key = parts.pop();
+    if (key === '' && parts[parts.length - 1] === '') { parts.pop(); key = '+'; }
+    const mods = new Set(parts.map((p) => (p === 'Mod' ? (mac ? 'Meta' : 'Ctrl') : p === 'Cmd' ? 'Meta' : p === 'Control' ? 'Ctrl' : p === 'Option' ? 'Alt' : p)));
+    return [...MOD_ORDER.filter((m) => mods.has(m)), key].join('+');
+  }
+
+  const splitCombo = (combo) => {
+    const parts = combo.split('+');
+    let key = parts.pop();
+    if (key === '' && parts[parts.length - 1] === '') { parts.pop(); key = '+'; }
+    return { mods: parts, key };
+  };
+
+  const MAC_MOD = { Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Meta: '⌘' };
+  const MAC_KEY = { Left: '←', Right: '→', Up: '↑', Down: '↓', Enter: '↩', Escape: 'Esc', Backspace: '⌫', Delete: '⌦', Tab: '⇥', Space: '空白鍵', PageUp: 'PgUp', PageDown: 'PgDn' };
+  const WIN_KEY = { Left: '←', Right: '→', Up: '↑', Down: '↓', Escape: 'Esc', Space: '空白鍵', PageUp: 'PgUp', PageDown: 'PgDn', Delete: 'Del' };
+
+  /** 顯示用：macOS ⌃⌥⇧⌘F，其他平台 Ctrl+Shift+F */
+  function comboLabel(combo, mac) {
+    if (!combo) return '';
+    const { mods, key } = splitCombo(combo);
+    if (mac) return mods.map((m) => MAC_MOD[m] || m).join('') + (MAC_KEY[key] || key);
+    return [...mods, WIN_KEY[key] || key].join('+');
+  }
+
+  /**
+   * ToolDock 視窗選單與系統使用的組合鍵：按下時選單會先處理，擴充畫面收不到。
+   * 對照 ToolDock 的 main.js buildMenu（檔案、編輯、檢視、視窗選單）。
+   */
+  const RESERVED_MAC = {
+    'Meta+W': '關閉分頁', 'Shift+Meta+W': '關閉視窗', 'Meta+Q': '結束 ToolDock', 'Meta+H': '隱藏 ToolDock', 'Alt+Meta+H': '隱藏其他應用程式',
+    'Meta+M': '縮到最小', 'Meta+Z': '還原', 'Shift+Meta+Z': '重做', 'Meta+X': '剪下', 'Meta+C': '拷貝', 'Meta+V': '貼上', 'Meta+A': '全選',
+    'Shift+Meta+P': '命令面板', 'Shift+Meta+X': '擴充管理', 'Shift+Meta+S': '擴充商店', 'Shift+Meta+L': '生命週期', 'Shift+Meta+U': '輸出面板',
+    'Meta+R': '重新載入', 'Alt+Meta+I': '開發者工具', 'Meta+0': '實際大小', 'Meta+=': '放大', 'Shift+Meta+=': '放大', 'Meta+-': '縮小', 'Ctrl+Meta+F': '全螢幕',
+  };
+  const RESERVED_WIN = {
+    'Ctrl+W': '關閉分頁', 'Ctrl+Z': '還原', 'Ctrl+Y': '重做', 'Ctrl+Shift+Z': '重做', 'Ctrl+X': '剪下', 'Ctrl+C': '複製', 'Ctrl+V': '貼上', 'Ctrl+A': '全選',
+    'Ctrl+Shift+P': '命令面板', 'Ctrl+Shift+X': '擴充管理', 'Ctrl+Shift+S': '擴充商店', 'Ctrl+Shift+L': '生命週期', 'Ctrl+Shift+U': '輸出面板',
+    'Ctrl+R': '重新載入', 'Ctrl+Shift+I': '開發者工具', 'Ctrl+0': '實際大小', 'Ctrl+=': '放大', 'Ctrl+Shift+=': '放大', 'Ctrl+-': '縮小', F11: '全螢幕', 'Alt+F4': '結束',
+  };
+  const reservedBy = (combo, mac) => (mac ? RESERVED_MAC : RESERVED_WIN)[combo] || null;
+
+  /**
+   * 檢查能不能當快捷鍵：回傳 null 表示可以，否則回傳原因。
+   * 沒有修飾鍵（或只有 Shift）的一般按鍵會擋住打字，只有 F1–F12 可以單獨使用。
+   */
+  function comboProblem(combo, mac) {
+    if (!combo) return '請按下組合鍵';
+    const { mods, key } = splitCombo(combo);
+    const fkey = /^F\d{1,2}$/.test(key);
+    if (!fkey && !mods.some((m) => m !== 'Shift')) return `單獨的按鍵或只加 ${mac ? '⇧' : 'Shift'} 會影響打字，請加上 ${mac ? '⌘、⌃ 或 ⌥' : 'Ctrl 或 Alt'}，或使用 F1–F12`;
+    if (['Tab', 'Escape'].includes(key) && !mods.some((m) => m !== 'Shift')) return 'Tab 與 Esc 是編輯器固定使用的按鍵';
+    const r = reservedBy(combo, mac);
+    if (r) return `這組按鍵是 ToolDock 選單的「${r}」，按下時選單會先處理，在這裡不會生效`;
+    return null;
+  }
+
+  /**
+   * 合併預設與使用者的設定：commands = [{ id, mac: [...], win: [...] }]，overrides = { id: [組合鍵…] }（空陣列表示不設定）。
+   * 回傳 { keys: Map<id, [組合鍵]>, index: Map<組合鍵, id>, conflicts: [[組合鍵, id, id]] }；
+   * 同一組按鍵被兩個功能使用時，使用者設定的優先，否則先列的優先。
+   */
+  function resolveKeymap(commands, overrides, mac) {
+    const keys = new Map();
+    const index = new Map();
+    const conflicts = [];
+    const custom = new Set();
+    for (const c of commands) {
+      const own = overrides && Object.prototype.hasOwnProperty.call(overrides, c.id) && Array.isArray(overrides[c.id]);
+      if (own) custom.add(c.id);
+      const list = (own ? overrides[c.id] : (mac ? c.mac : c.win) || []).map((k) => normalizeCombo(k, mac));
+      keys.set(c.id, [...new Set(list)]);
+    }
+    const order = [...commands.filter((c) => custom.has(c.id)), ...commands.filter((c) => !custom.has(c.id))];
+    for (const c of order) {
+      for (const k of keys.get(c.id)) {
+        if (index.has(k)) { conflicts.push([k, index.get(k), c.id]); continue; }
+        index.set(k, c.id);
+      }
+    }
+    for (const c of commands) keys.set(c.id, keys.get(c.id).filter((k) => index.get(k) === c.id));
+    return { keys, index, conflicts, custom };
+  }
+
+  /** 和預設相同的設定不必保存 */
+  function sameKeys(a, b) {
+    return a.length === b.length && a.every((k, i) => k === b[i]);
+  }
+
   return {
     LANGS, LANG_NAME, langFor, lineComment, escapeHtml, splitHtmlLines, cursorInfo, lineStart, lineRange,
     indent, newline, toggleComment, toLines, diffLines, sideBySide, unified, fold, diffStats,
     hunks, revertHunk, sameHunk,
     searchRegex, findInText, expandReplacement, applyReplacements, splitList, globRegex, pathFilter,
+    symbolsIn, symbolFamily, symbolCaseInsensitive, wordAt, importHints, rankDefinitions, joinPath,
+    comboFromEvent, normalizeCombo, comboLabel, comboProblem, reservedBy, resolveKeymap, sameKeys,
   };
 }));

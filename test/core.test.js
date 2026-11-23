@@ -222,3 +222,143 @@ test('檔案篩選：名稱、資料夾、根目錄路徑、** 與大括號', ()
   assert.deepEqual(C.splitList('*.{js,ts}, a ,,b'), ['*.{js,ts}', 'a', 'b']);
   assert.ok(f('SRC/')('src/b.ts'), '不分大小寫');
 });
+
+const syms = (text, lang) => C.symbolsIn(text, lang).map((s) => `${s.kind}:${s.name}@${s.line}`);
+
+test('定義：JavaScript／TypeScript 的函式、類別、方法、變數，呼叫與控制敘述不算', () => {
+  const js = [
+    "import { helper } from './lib/util';",
+    'export async function main(a) {}',
+    'class Shop extends Base {',
+    '  constructor() {}',
+    '  async total(items) {',
+    '    if (x) { return 1; }',
+    '    for (const a of b) {}',
+    '    helper(items);',
+    '  }',
+    '  handle = async (e) => {};',
+    '}',
+    'const fmt = (x) => x;',
+    'module.exports.calc = calc;',
+    'export interface Options { a: number }',
+    "describe('x', function () {",
+  ].join('\n');
+  assert.deepEqual(syms(js, 'javascript'), ['函式:main@2', '類別:Shop@3', '方法:constructor@4', '方法:total@5', '方法:handle@10', '變數:fmt@12', '匯出:calc@13', '型別:Options@14']);
+  const s = C.symbolsIn(js, 'typescript').find((x) => x.name === 'total');
+  assert.equal(s.col, 9);
+  assert.equal(s.text, 'async total(items) {');
+});
+
+test('定義：Java 的類別、建構子、方法、欄位；return／new／throw 不算', () => {
+  const java = [
+    'package a.b;',
+    'public class Order implements Serializable {',
+    '  private static final long serialVersionUID = 1L;',
+    '  private List<String> items = new ArrayList<>();',
+    '  public Order(int a) { super(); }',
+    '  public Map<String, List<Item>> total(List<Item> items) throws Exception {',
+    '    return calc(items);',
+    '    String s = foo(1);',
+    '    throw new IllegalStateException("x");',
+    '  }',
+    '  int count() { return 0; }',
+    '  interface Listener { void changed(); }',
+    '}',
+  ].join('\n');
+  assert.deepEqual(syms(java, 'java'), ['類別:Order@2', '欄位:serialVersionUID@3', '欄位:items@4', '建構子:Order@5', '方法:total@6', '方法:count@11', '類別:Listener@12']);
+});
+
+test('定義：Python、Go、C、SQL（不分大小寫）、Kotlin', () => {
+  assert.deepEqual(syms('def a():\n  pass\nclass B:\n  def m(self):\n    self.x = 1\nY = 2\nif y == 3: pass\n', 'python'), ['函式:a@1', '類別:B@3', '函式:m@4', '屬性:x@5', '變數:Y@6']);
+  assert.deepEqual(syms('func main() {}\nfunc (s *Srv) Handle(w W) {}\ntype Srv struct{}\nvar Version = 1\n', 'go'), ['函式:main@1', '函式:Handle@2', '型別:Srv@3', '變數:Version@4']);
+  assert.deepEqual(syms('static int add(int a, int b) {\n  return add(1, 2);\n}\n#define MAX 3\nstruct node { int x; };\n', 'c'), ['函式:add@1', '巨集:MAX@4', '型別:node@5']);
+  assert.deepEqual(syms('CREATE OR REPLACE PACKAGE BODY hr.emp_pkg IS\n  PROCEDURE raise_salary(p IN NUMBER) IS\n  function get_name RETURN VARCHAR2;\n', 'sql'), ['物件:emp_pkg@1', '物件:raise_salary@2', '物件:get_name@3']);
+  assert.ok(C.symbolCaseInsensitive('sql') && !C.symbolCaseInsensitive('java'));
+  assert.deepEqual(syms('class Repo {\n  fun <T> find(id: Long): T? = null\n  val size: Int get() = 0\n}\n', 'kotlin'), ['類別:Repo@1', '函式:find@2', '屬性:size@3']);
+  assert.deepEqual(C.symbolsIn('anything', 'markdown'), [], '沒有規則的語言');
+});
+
+test('定義：病態的長行不會讓規則運算式卡住', () => {
+  const t0 = Date.now();
+  C.symbolsIn(`${'x'.repeat(3000)}${' *'.repeat(500)} (\n`.repeat(30), 'c');
+  C.symbolsIn(`${'a b '.repeat(2000)}(\n`.repeat(30), 'java');
+  assert.ok(Date.now() - t0 < 1500, `${Date.now() - t0} ms`);
+});
+
+test('游標下的名稱與 import 來源', () => {
+  assert.deepEqual(C.wordAt('a.getName()', 4, 'javascript'), { name: 'getName', start: 2, end: 9 });
+  assert.deepEqual(C.wordAt('a.getName()', 9, 'javascript'), { name: 'getName', start: 2, end: 9 }, '在名稱結尾也算');
+  assert.equal(C.wordAt('a + b', 2, 'javascript'), null);
+  assert.equal(C.wordAt('x = 123', 5, 'javascript'), null, '數字不是名稱');
+  assert.equal(C.wordAt('$this->name', 8, 'php').name, 'name');
+  assert.equal(C.wordAt('do-thing arg', 3, 'bash').name, 'do-thing');
+  assert.equal(C.wordAt('obj.empty? x', 6, 'ruby').name, 'empty?');
+  const js = "import { a, helper as h } from '../lib/util.js';\nconst { calc } = require('./calc');\nimport x from 'react';";
+  assert.deepEqual(C.importHints(js, 'helper', 'javascript', 'src/app/main.js'), ['src/lib/util']);
+  assert.deepEqual(C.importHints(js, 'calc', 'javascript', 'src/app/main.js'), ['src/app/calc']);
+  assert.deepEqual(C.importHints(js, 'x', 'javascript', 'src/app/main.js'), [], '套件不是專案檔案');
+  assert.deepEqual(C.importHints('from .models import User, Item\nfrom ..core import base\nfrom pkg.sub import thing', 'User', 'python', 'app/web/views.py'), ['app/web/models']);
+  assert.deepEqual(C.importHints('from ..core import base', 'base', 'python', 'app/web/views.py'), ['app/core']);
+  assert.deepEqual(C.importHints('import a.c.Helper;\nimport static a.d.Util.max;', 'Helper', 'java', 'x/Order.java'), ['a/c/Helper']);
+  assert.deepEqual(C.importHints('import static a.d.Util.max;', 'Util', 'java', 'x/Order.java'), ['a/d/Util']);
+});
+
+test('定義排序：import 的檔案 → 同檔案 → 同語言同資料夾 → 同語言 → 其他語言；排除游標所在的定義本身', () => {
+  const it = (rel, line, family = 'js', col = 1) => ({ rel, line, col, name: 'run', family });
+  const items = [it('z/other.py', 1, 'py'), it('lib/b.js', 3), it('src/a.js', 9), it('src/sib.js', 2), it('lib/util.js', 5), it('src/a.js', 20, 'js', 5)];
+  const r = C.rankDefinitions(items, { rel: 'src/a.js', family: 'js', hints: ['lib/util'], self: { rel: 'src/a.js', line: 20, col: 7 } });
+  assert.deepEqual(r.map((x) => `${x.score}:${x.rel}:${x.line}`), ['0:lib/util.js:5', '1:src/a.js:9', '2:src/sib.js:2', '3:lib/b.js:3', '4:z/other.py:1']);
+  assert.deepEqual(C.rankDefinitions([it('src/a.js', 20, 'js', 5)], { rel: 'src/a.js', family: 'js', self: { rel: 'src/a.js', line: 20, col: 5 } }), [], '只有自己');
+});
+
+test('快捷鍵：按鍵事件 → 組合鍵（依實體按鍵，Shift 不改變按鍵）、顯示文字', () => {
+  assert.equal(C.comboFromEvent({ code: 'KeyF', metaKey: true, shiftKey: true }), 'Shift+Meta+F');
+  assert.equal(C.comboFromEvent({ code: 'Minus', ctrlKey: true, shiftKey: true }), 'Ctrl+Shift+-');
+  assert.equal(C.comboFromEvent({ code: 'Digit1', altKey: true }), 'Alt+1');
+  assert.equal(C.comboFromEvent({ code: 'F12', shiftKey: true }), 'Shift+F12');
+  assert.equal(C.comboFromEvent({ code: 'ArrowLeft', altKey: true }), 'Alt+Left');
+  assert.equal(C.comboFromEvent({ code: 'ShiftLeft', shiftKey: true }), null, '只按修飾鍵');
+  assert.equal(C.comboFromEvent({ code: '' }), null);
+  assert.equal(C.normalizeCombo('Mod+Shift+F', true), 'Shift+Meta+F');
+  assert.equal(C.normalizeCombo('Shift+Mod+F', false), 'Ctrl+Shift+F');
+  assert.equal(C.normalizeCombo('Cmd+Option+Control+K', true), 'Ctrl+Alt+Meta+K');
+  assert.equal(C.comboLabel('Ctrl+Alt+Shift+Meta+K', true), '⌃⌥⇧⌘K');
+  assert.equal(C.comboLabel('Ctrl+Shift+F', false), 'Ctrl+Shift+F');
+  assert.equal(C.comboLabel('Ctrl+-', true), '⌃-');
+  assert.equal(C.comboLabel('Alt+Left', false), 'Alt+←');
+});
+
+test('快捷鍵：不能用的組合（影響打字、ToolDock 選單保留）', () => {
+  assert.match(C.comboProblem('A', true), /影響打字/);
+  assert.match(C.comboProblem('Shift+A', false), /影響打字/);
+  assert.equal(C.comboProblem('F5', true), null, 'F1–F12 可以單獨使用');
+  assert.equal(C.comboProblem('Alt+Meta+F', true), null);
+  assert.match(C.comboProblem('Shift+Meta+S', true), /擴充商店/);
+  assert.match(C.comboProblem('Meta+H', true), /隱藏 ToolDock/);
+  assert.match(C.comboProblem('Ctrl+W', false), /關閉分頁/);
+  assert.equal(C.comboProblem('Meta+H', false), null, 'Windows 沒有 ⌘');
+  assert.equal(C.reservedBy('Ctrl+Shift+S', false), '擴充商店');
+});
+
+test('快捷鍵：合併預設與自訂；同一組按鍵衝突時自訂優先；空陣列表示不設定', () => {
+  const cmds = [
+    { id: 'a', mac: ['Mod+P'], win: ['Mod+P'] },
+    { id: 'b', mac: ['Mod+G', 'F3'], win: ['F3'] },
+    { id: 'c', mac: ['Mod+P'], win: ['Ctrl+Q'] }, // 和 a 衝突（macOS）
+  ];
+  let m = C.resolveKeymap(cmds, {}, true);
+  assert.deepEqual(m.keys.get('a'), ['Meta+P']);
+  assert.deepEqual(m.keys.get('c'), [], '先列的優先');
+  assert.deepEqual(m.conflicts, [['Meta+P', 'a', 'c']]);
+  assert.equal(m.index.get('F3'), 'b');
+  m = C.resolveKeymap(cmds, { c: ['Mod+P'], b: [] }, true);
+  assert.deepEqual(m.keys.get('c'), ['Meta+P'], '自訂優先');
+  assert.deepEqual(m.keys.get('a'), []);
+  assert.deepEqual(m.keys.get('b'), [], '空陣列：不設定');
+  assert.equal(m.index.get('F3'), undefined);
+  assert.ok(m.custom.has('c') && !m.custom.has('a'));
+  m = C.resolveKeymap(cmds, {}, false);
+  assert.deepEqual(m.keys.get('a'), ['Ctrl+P']);
+  assert.deepEqual(m.keys.get('c'), ['Ctrl+Q']);
+  assert.ok(C.sameKeys(['a', 'b'], ['a', 'b']) && !C.sameKeys(['a'], ['b']));
+});

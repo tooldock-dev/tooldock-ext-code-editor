@@ -19,8 +19,9 @@
           <button class="item" data-act="revealProject">在檔案管理員中顯示</button>
           <button class="item" data-act="removeProject">從清單移除專案</button>
           <div class="sep"></div>
-          <button class="item" data-act="newFile">新增未命名檔案<span class="k" data-key="N"></span></button>
-          <button class="item" data-act="openFile">開啟檔案…<span class="k" data-key="O"></span></button>
+          <button class="item" data-act="newFile">新增未命名檔案<span class="k" data-cmd="newFile"></span></button>
+          <button class="item" data-act="openFile">開啟檔案…<span class="k" data-cmd="openFile"></span></button>
+          <button class="item" data-act="keybindings">鍵盤快捷鍵…<span class="k" data-cmd="keybindings"></span></button>
           <div id="recentBox"></div>
         </div>
       </div>
@@ -107,12 +108,7 @@
           <button id="welcomeAdd">＋ 建立專案…</button>
           <button class="secondary" id="welcomeOpen">開啟檔案…</button>
         </div>
-        <table class="keys">
-          <tr><td>⌘P</td><td>搜尋檔名</td><td>⌘S</td><td>儲存</td></tr>
-          <tr><td>⌘F</td><td>尋找／取代</td><td>⌃G</td><td>前往行</td></tr>
-          <tr><td>⌘/</td><td>切換註解</td><td>⇥ / ⇧⇥</td><td>縮排／取消縮排</td></tr>
-          <tr><td>⌘⇧F</td><td>在專案中搜尋</td><td>⌘⇧H</td><td>在專案中取代</td></tr>
-        </table>
+        <table class="keys" id="welcomeKeys"></table>
       </div>
     </div>
   </main>
@@ -126,10 +122,27 @@
     <button class="sb" id="stIndent" title="縮排方式"></button>
     <button class="sb" id="stEol" title="換行字元（點一下切換）"></button>
     <span id="stEnc"></span>
+    <button class="sb" id="stKeys" title="鍵盤快捷鍵">⌨</button>
     <select id="stLang" title="語言"></select>
   </footer>
 
   <div id="ctxMenu" class="menu" hidden></div>
+  <div id="defPick" class="menu" tabindex="-1" hidden></div>
+
+  <div id="keysPanel" hidden>
+    <div id="keysBox" role="dialog" aria-label="鍵盤快捷鍵">
+      <div class="khead">
+        <b>鍵盤快捷鍵</b>
+        <input id="keysFilter" type="search" placeholder="搜尋功能或按鍵" spellcheck="false" autocomplete="off">
+        <button class="secondary sm" id="keysByKey">⌨ 以按鍵查詢</button>
+        <button class="secondary sm" id="keysResetAll">全部還原預設</button>
+        <button class="ib" id="keysClose" title="關閉（Esc）">✕</button>
+      </div>
+      <div class="khelp">點 ✎ 或雙擊一列後按下新的組合鍵；＋ 可以再加一組，✕ 移除，↺ 還原預設。</div>
+      <div id="keysBody"></div>
+      <div id="keysNote"></div>
+    </div>
+  </div>
 
   <div id="modal" hidden>
     <form id="modalBox">
