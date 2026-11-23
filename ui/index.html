@@ -27,6 +27,7 @@
     </div>
     <div id="sideTabs">
       <button data-side="files" class="on">檔案</button>
+      <button data-side="search">搜尋</button>
       <button data-side="git">變更 <span class="badge" id="gitCount" hidden>0</span></button>
     </div>
 
@@ -39,6 +40,36 @@
         <button class="ib sm" data-act="collapse" title="全部收合">⊟</button>
       </div>
       <div id="tree" class="list" tabindex="0"></div>
+    </section>
+
+    <section id="searchPane" class="pane" hidden>
+      <div id="sForm">
+        <div class="srow">
+          <button class="ib sm tw-btn" id="sRepToggle" title="切換取代">▸</button>
+          <div class="sbox">
+            <input id="sQuery" placeholder="在專案中搜尋" spellcheck="false" autocomplete="off">
+            <button class="ib sm tog" id="sCase" title="大小寫須相符">Aa</button>
+            <button class="ib sm tog" id="sWord" title="整個字相符">ab</button>
+            <button class="ib sm tog" id="sRegex" title="規則運算式">.*</button>
+          </div>
+        </div>
+        <div class="srow" id="sRepRow" hidden>
+          <span class="tw-pad"></span>
+          <div class="sbox">
+            <input id="sReplace" placeholder="取代為（規則運算式可用 $1）" spellcheck="false" autocomplete="off">
+          </div>
+        </div>
+        <div class="srow">
+          <span class="tw-pad"></span>
+          <button class="linkish" id="sMoreBtn">▸ 檔案篩選</button>
+        </div>
+        <div id="sMore" hidden>
+          <input id="sInclude" placeholder="要包含的檔案：*.js, src/" spellcheck="false" autocomplete="off">
+          <input id="sExclude" placeholder="要排除的檔案：*.min.js, test" spellcheck="false" autocomplete="off">
+        </div>
+      </div>
+      <div id="sBar"></div>
+      <div id="sResults" class="list" tabindex="0"></div>
     </section>
 
     <section id="gitPane" class="pane" hidden>
@@ -80,6 +111,7 @@
           <tr><td>⌘P</td><td>搜尋檔名</td><td>⌘S</td><td>儲存</td></tr>
           <tr><td>⌘F</td><td>尋找／取代</td><td>⌃G</td><td>前往行</td></tr>
           <tr><td>⌘/</td><td>切換註解</td><td>⇥ / ⇧⇥</td><td>縮排／取消縮排</td></tr>
+          <tr><td>⌘⇧F</td><td>在專案中搜尋</td><td>⌘⇧H</td><td>在專案中取代</td></tr>
         </table>
       </div>
     </div>

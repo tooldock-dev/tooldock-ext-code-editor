@@ -1,6 +1,6 @@
 'use strict';
 /**
- * 程式碼編輯器後端：專案清單、專案檔案樹、檔案讀寫、Git 異動清單與比對內容。
+ * 程式碼編輯器後端：專案清單、專案檔案樹、檔案讀寫、跨檔案搜尋與取代、Git 異動清單、比對內容、還原與檔案歷史。
  * 編輯中的內容在畫面上；後端只處理檔案系統與 git。
  */
 const fs = require('fs');
@@ -8,6 +8,8 @@ const path = require('path');
 const crypto = require('crypto');
 const files = require('./files');
 const git = require('./git');
+const search = require('./search');
+const edits = require('./edits');
 
 let ctx = null;
 let pendingCommand = null; // 畫面還沒開時收到的指令
@@ -129,6 +131,55 @@ exports.activate = (context) => {
     return git.diffSides(real, { area, path: rel, orig }, gitPath());
   });
 
+  /** 專案所在的儲存庫；畫面傳來的 top 必須相同（避免切換專案後誤用舊的路徑） */
+  const repoOf = async (id, top) => {
+    const p = project(id);
+    const real = await git.topLevel(p.root, gitPath());
+    if (!real || path.resolve(String(top || '')) !== real) throw new Error('儲存庫已變更，請重新整理');
+    return { p, top: real };
+  };
+  const done = (op, extra) => ({ ...extra, undoId: edits.commit(op) });
+
+  // 跨檔案搜尋與取代
+  h('search', ({ id, ...opts }) => search.search(project(id).root, opts, exclude()));
+  h('cancelSearch', () => { search.cancel(); return true; });
+  h('replaceInFiles', ({ id, label, items }) => {
+    const op = edits.begin(label || '取代');
+    const results = search.replaceInFiles(project(id).root, Array.isArray(items) ? items : [], op);
+    const n = results.reduce((s, r) => s + r.count, 0);
+    if (n) ctx.log.info(`跨檔案取代：${results.filter((r) => r.ok).length} 個檔案、${n} 處`);
+    return done(op, { results });
+  });
+  h('undo', (undoId) => edits.undo(undoId));
+
+  // Git 還原與檔案歷史
+  h('gitRestore', async ({ id, top, items }) => {
+    const r = await repoOf(id, top);
+    const op = edits.begin('還原 Git 變更');
+    const results = await git.restore(r.top, r.p.root, Array.isArray(items) ? items : [], op, gitPath());
+    return done(op, { results });
+  });
+  h('gitRevertHunk', async ({ id, top, path: rel, hunk }) => {
+    const r = await repoOf(id, top);
+    const op = edits.begin('還原一段變更');
+    const res = await git.revertHunk(r.top, r.p.root, rel, hunk, op, gitPath());
+    return done(op, res);
+  });
+  h('gitLog', async ({ id, top, path: rel }) => {
+    const r = await repoOf(id, top);
+    return git.fileLog(r.top, r.p.root, rel, gitPath());
+  });
+  h('gitVersion', async ({ id, top, ...o }) => {
+    const r = await repoOf(id, top);
+    return git.versionSides(r.top, r.p.root, o, gitPath());
+  });
+  h('gitRestoreVersion', async ({ id, top, ...o }) => {
+    const r = await repoOf(id, top);
+    const op = edits.begin('還原成歷史版本');
+    const res = await git.restoreVersion(r.top, r.p.root, o, op, gitPath());
+    return done(op, res);
+  });
+
   h('takePending', () => {
     const c = pendingCommand;
     pendingCommand = null;
@@ -145,12 +196,14 @@ exports.activate = (context) => {
     ctx.commands.register('codeEditor.addProject', () => toView('addProject')),
     ctx.commands.register('codeEditor.openFile', () => toView('openFile')),
     ctx.commands.register('codeEditor.showChanges', () => toView('showChanges')),
+    ctx.commands.register('codeEditor.search', () => toView('search')),
     ctx.settings.onDidChange((key) => ctx.ui.emit('settingsChanged', { key, settings: ctx.settings.all() })),
   );
 };
 
 exports.deactivate = () => {
   pendingCommand = null;
+  search.cancel();
 };
 
 // 測試用

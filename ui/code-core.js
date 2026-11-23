@@ -350,8 +350,181 @@
     return { added, removed };
   }
 
+  /** 每一段變更：{ aStart, aLen, bStart, bLen }（與 blocks 的分段相同，順序也相同） */
+  function hunks(ops) {
+    const out = [];
+    let ai = 0, bi = 0, cur = null;
+    for (const o of ops) {
+      if (o.t === '=') { cur = null; ai = o.a + 1; bi = o.b + 1; continue; }
+      if (!cur) { cur = { aStart: ai, aLen: 0, bStart: bi, bLen: 0 }; out.push(cur); }
+      if (o.t === '-') { cur.aLen++; ai = o.a + 1; } else { cur.bLen++; bi = o.b + 1; }
+    }
+    return out;
+  }
+
+  /** 把右側（b）的一段變更改回左側（a）的內容，回傳新的 b 行陣列 */
+  function revertHunk(a, b, h) {
+    return [...b.slice(0, h.bStart), ...a.slice(h.aStart, h.aStart + h.aLen), ...b.slice(h.bStart + h.bLen)];
+  }
+
+  const sameHunk = (x, y) => !!x && !!y && x.aStart === y.aStart && x.aLen === y.aLen && x.bStart === y.bStart && x.bLen === y.bLen;
+
+  /* ───────────── 跨檔案搜尋與取代 ───────────── */
+
+  const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  /**
+   * 搜尋條件 → RegExp（g、m 旗標；不分大小寫時加 i）。query 是空的回傳 null；規則運算式寫錯會丟出錯誤。
+   * word：整個字相符（前後不能是英數字或底線）。
+   */
+  function searchRegex({ query, regex = false, caseSens = false, word = false } = {}) {
+    if (!query) return null;
+    let src = regex ? String(query) : escapeRe(query);
+    if (word) src = `(?<![\\w])(?:${src})(?![\\w])`;
+    return new RegExp(src, caseSens ? 'gm' : 'gim');
+  }
+
+  const PREVIEW_BEFORE = 50;
+  const PREVIEW_AFTER = 120;
+
+  /**
+   * 在文字（換行已統一成 \n）中找出所有符合處：
+   *   { line, col（從 1 起算）, start, end（字元位置）, text, before, after, cut（before 前面還有內容）, multi（跨行）, g?, ng? }
+   * groups 為 true 時附上擷取群組（取代時展開 $1、$<name> 用）。最多 limit 筆，超過時 truncated。
+   */
+  function findInText(text, re, { limit = 10000, groups = false } = {}) {
+    const matches = [];
+    if (!re) return { matches, truncated: false };
+    re.lastIndex = 0;
+    let line = 0, ls = 0, scan = 0, m, truncated = false;
+    while ((m = re.exec(text))) {
+      if (m[0] === '') { re.lastIndex++; continue; }
+      if (matches.length >= limit) { truncated = true; break; }
+      for (let i = text.indexOf('\n', scan); i >= 0 && i < m.index; i = text.indexOf('\n', i + 1)) { line++; ls = i + 1; }
+      scan = m.index;
+      let le = text.indexOf('\n', m.index);
+      if (le < 0) le = text.length;
+      const end = m.index + m[0].length;
+      const from = Math.max(ls, m.index - PREVIEW_BEFORE);
+      const multi = end > le; // 跨行的符合只顯示第一行
+      const hit = {
+        line: line + 1, col: m.index - ls + 1, start: m.index, end, text: m[0],
+        before: text.slice(from, m.index), cut: from > ls,
+        after: multi ? '' : text.slice(end, Math.min(le, end + PREVIEW_AFTER)),
+        multi,
+      };
+      if (groups) {
+        hit.g = m.slice(1).map((x) => (x === undefined ? null : x));
+        if (m.groups) hit.ng = { ...m.groups };
+      }
+      matches.push(hit);
+    }
+    return { matches, truncated };
+  }
+
+  /**
+   * 取代字串：一般模式照原樣；規則運算式模式支援 $1…$99、$<name>、$&（或 $0）、$$，以及 \n、\t、\\。
+   */
+  function expandReplacement(rep, match, regex) {
+    rep = String(rep);
+    if (!regex) return rep;
+    const g = match.g || [];
+    let out = '';
+    for (let i = 0; i < rep.length; i++) {
+      const c = rep[i];
+      const n = rep[i + 1];
+      if (c === '\\' && n !== undefined) {
+        if (n === 'n') { out += '\n'; i++; continue; }
+        if (n === 't') { out += '\t'; i++; continue; }
+        if (n === '\\') { out += '\\'; i++; continue; }
+      } else if (c === '$' && n !== undefined) {
+        if (n === '$') { out += '$'; i++; continue; }
+        if (n === '&') { out += match.text; i++; continue; }
+        if (n === '<' && match.ng) {
+          const e = rep.indexOf('>', i + 2);
+          if (e > 0) { const v = match.ng[rep.slice(i + 2, e)]; out += v == null ? '' : v; i = e; continue; }
+        }
+        if (n >= '0' && n <= '9') {
+          const two = rep.slice(i + 1, i + 3);
+          if (/^\d\d$/.test(two) && Number(two) >= 1 && Number(two) <= g.length) { out += g[Number(two) - 1] ?? ''; i += 2; continue; }
+          const k = Number(n);
+          if (k === 0) { out += match.text; i++; continue; }
+          if (k <= g.length) { out += g[k - 1] ?? ''; i++; continue; }
+        }
+      }
+      out += c;
+    }
+    return out;
+  }
+
+  /**
+   * 套用取代：reps 為 [{ start, end, text, replacement }]。
+   * 每一處的原文都必須和 text 相同、彼此不能重疊，否則回傳 null（檔案在搜尋之後被改過）。
+   */
+  function applyReplacements(text, reps) {
+    const list = [...reps].sort((a, b) => a.start - b.start);
+    let out = '';
+    let pos = 0;
+    for (const r of list) {
+      if (r.start < pos || r.end < r.start || text.slice(r.start, r.end) !== r.text) return null;
+      out += text.slice(pos, r.start) + r.replacement;
+      pos = r.end;
+    }
+    return out + text.slice(pos);
+  }
+
+  /** 逗號分隔的清單；大括號裡的逗號不算（*.{js,ts}） */
+  function splitList(spec) {
+    const out = [];
+    let cur = '', depth = 0;
+    for (const ch of String(spec || '')) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth = Math.max(0, depth - 1);
+      if (ch === ',' && !depth) { out.push(cur); cur = ''; } else cur += ch;
+    }
+    out.push(cur);
+    return out.map((s) => s.trim()).filter(Boolean);
+  }
+
+  /**
+   * 檔案篩選樣式 → RegExp（比對專案相對路徑，分隔字元為 /）：
+   *   沒有 / 的樣式比對任何一層名稱：*.js、test、*.min.*
+   *   有 / 的樣式從專案根目錄比對：src/、src/**\/*.ts、docs/a.md
+   *   支援 *、**、?、{a,b}；比對到資料夾時，裡面的檔案都算
+   */
+  function globRegex(pattern) {
+    let s = String(pattern).trim().replace(/\\/g, '/');
+    if (s.startsWith('./')) s = s.slice(2);
+    const anchored = s.replace(/\/+$/, '').includes('/') || s.startsWith('/');
+    s = s.replace(/^\/+/, '').replace(/\/+$/, '');
+    if (!s) return null;
+    let re = '';
+    let brace = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '*') {
+        if (s[i + 1] === '*') {
+          if (s[i + 2] === '/') { re += '(?:.*/)?'; i += 2; } else { re += '.*'; i++; }
+        } else re += '[^/]*';
+      } else if (c === '?') re += '[^/]';
+      else if (c === '{') { re += '(?:'; brace++; } else if (c === '}' && brace) { re += ')'; brace--; } else if (c === ',' && brace) re += '|';
+      else re += escapeRe(c);
+    }
+    re += ')'.repeat(brace);
+    return new RegExp(anchored ? `^${re}(?:/.*)?$` : `(?:^|/)${re}(?:/|$)`, 'i');
+  }
+
+  /** 包含／排除樣式 → (rel) => 是否要搜尋 */
+  function pathFilter(include, exclude) {
+    const inc = splitList(include).map(globRegex).filter(Boolean);
+    const exc = splitList(exclude).map(globRegex).filter(Boolean);
+    return (rel) => (!inc.length || inc.some((r) => r.test(rel))) && !exc.some((r) => r.test(rel));
+  }
+
   return {
     LANGS, LANG_NAME, langFor, lineComment, escapeHtml, splitHtmlLines, cursorInfo, lineStart, lineRange,
     indent, newline, toggleComment, toLines, diffLines, sideBySide, unified, fold, diffStats,
+    hunks, revertHunk, sameHunk,
+    searchRegex, findInText, expandReplacement, applyReplacements, splitList, globRegex, pathFilter,
   };
 }));

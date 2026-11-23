@@ -116,3 +116,109 @@ test('並排與行內的列；未變更的長段落摺疊', () => {
   assert.equal(folded.length, 1 + 3 + 2 + 1);
   assert.equal(C.fold(sbs, 3, new Set([0])).length, sbs.length, '展開後全部顯示');
 });
+
+test('變更分段：與並排比對的分段一致；逐段改回左側內容', () => {
+  const a = C.toLines('a\nb\nc\nd\ne\nf\n');
+  const b = C.toLines('a\nB\nc\nd\nx\ny\ne\n');
+  const hs = C.hunks(C.diffLines(a, b));
+  assert.deepEqual(hs, [
+    { aStart: 1, aLen: 1, bStart: 1, bLen: 1 },
+    { aStart: 4, aLen: 0, bStart: 4, bLen: 2 },
+    { aStart: 5, aLen: 1, bStart: 7, bLen: 0 },
+  ]);
+  assert.deepEqual(C.revertHunk(a, b, hs[0]), ['a', 'b', 'c', 'd', 'x', 'y', 'e']);
+  assert.deepEqual(C.revertHunk(a, b, hs[1]), ['a', 'B', 'c', 'd', 'e']);
+  assert.deepEqual(C.revertHunk(a, b, hs[2]), ['a', 'B', 'c', 'd', 'x', 'y', 'e', 'f']);
+  // 每一段都改回去就等於左側
+  let cur = b;
+  for (let i = hs.length - 1; i >= 0; i--) cur = C.revertHunk(a, cur, hs[i]);
+  assert.deepEqual(cur, a);
+  assert.ok(C.sameHunk(hs[1], { ...hs[1] }));
+  assert.ok(!C.sameHunk(hs[1], hs[2]));
+  // 隨機資料：分段數與並排比對的變更區塊數相同
+  let seed = 3;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  for (let k = 0; k < 100; k++) {
+    const x = Array.from({ length: rnd(20) }, () => String(rnd(4)));
+    const y = Array.from({ length: rnd(20) }, () => String(rnd(4)));
+    const ops = C.diffLines(x, y);
+    const rows = C.sideBySide(ops);
+    const starts = rows.filter((r, i) => r.kind !== 'eq' && (i === 0 || rows[i - 1].kind === 'eq')).length;
+    const h = C.hunks(ops);
+    assert.equal(h.length, starts);
+    let z = y;
+    for (let i = h.length - 1; i >= 0; i--) z = C.revertHunk(x, z, h[i]);
+    assert.deepEqual(z, x);
+  }
+});
+
+test('跨檔案搜尋：行欄位置、大小寫、整個字、規則運算式、預覽', () => {
+  const text = 'const foo = 1;\nlet Foo2 = foo + food;\n\tfoo();\n';
+  const find = (o) => C.findInText(text, C.searchRegex(o)).matches;
+  assert.deepEqual(find({ query: 'foo' }).map((m) => [m.line, m.col]), [[1, 7], [2, 5], [2, 12], [2, 18], [3, 2]]);
+  assert.equal(find({ query: 'foo', caseSens: true }).length, 4);
+  assert.deepEqual(find({ query: 'foo', word: true }).map((m) => [m.line, m.col]), [[1, 7], [2, 12], [3, 2]]);
+  assert.deepEqual(find({ query: 'fo+\\d', regex: true }).map((m) => m.text), ['Foo2']);
+  assert.equal(find({ query: 'a.b' }).length, 0, '一般模式不把 . 當萬用字元');
+  const m = find({ query: 'food' })[0];
+  assert.equal(text.slice(m.start, m.end), 'food');
+  assert.equal(m.before, 'let Foo2 = foo + ');
+  assert.equal(m.after, ';');
+  assert.equal(m.cut, false);
+  assert.equal(C.searchRegex({ query: '' }), null);
+  assert.throws(() => C.searchRegex({ query: '(', regex: true }));
+  // 長的行：前面截掉；跨行的符合只顯示第一行
+  const long = `${'x'.repeat(100)}needle tail`;
+  const lm = C.findInText(long, C.searchRegex({ query: 'needle' })).matches[0];
+  assert.equal(lm.cut, true);
+  assert.equal(lm.before.length, 50);
+  const ml = C.findInText('a\nbc\nd', C.searchRegex({ query: 'b[^]*d', regex: true })).matches[0];
+  assert.equal(ml.multi, true);
+  assert.equal(ml.text, 'bc\nd');
+  // 上限
+  const r = C.findInText('aaaa', C.searchRegex({ query: 'a' }), { limit: 2 });
+  assert.equal(r.matches.length, 2);
+  assert.equal(r.truncated, true);
+  // 空字串的符合不會卡住
+  assert.equal(C.findInText('abc', C.searchRegex({ query: 'x*', regex: true })).matches.length, 0);
+});
+
+test('取代字串：$1、$<name>、$&、$$、\\n；一般模式照原樣', () => {
+  const re = C.searchRegex({ query: '(?<k>\\w+)=(\\d+)', regex: true });
+  const m = C.findInText('a=1', re, { groups: true }).matches[0];
+  assert.equal(C.expandReplacement('$2:$1', m, true), '1:a');
+  assert.equal(C.expandReplacement('$<k>-$&-$0-$$1', m, true), 'a-a=1-a=1-$1');
+  assert.equal(C.expandReplacement('x\\ny\\t\\\\', m, true), 'x\ny\t\\');
+  assert.equal(C.expandReplacement('$9', m, true), '$9', '沒有的群組照原樣');
+  assert.equal(C.expandReplacement('$1\\n', m, false), '$1\\n');
+  const g = C.findInText('abcdefghijkl', C.searchRegex({ query: '(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)', regex: true }), { groups: true }).matches[0];
+  assert.equal(C.expandReplacement('$11$10', g, true), 'kj');
+});
+
+test('套用取代：檢查原文、不能重疊', () => {
+  const text = 'one two one';
+  assert.equal(C.applyReplacements(text, [
+    { start: 8, end: 11, text: 'one', replacement: '1' },
+    { start: 0, end: 3, text: 'one', replacement: 'ONE' },
+  ]), 'ONE two 1');
+  assert.equal(C.applyReplacements(text, [{ start: 0, end: 3, text: 'two', replacement: '' }]), null, '原文不同');
+  assert.equal(C.applyReplacements(text, [
+    { start: 0, end: 3, text: 'one', replacement: '' },
+    { start: 2, end: 5, text: 'e t', replacement: '' },
+  ]), null, '重疊');
+});
+
+test('檔案篩選：名稱、資料夾、根目錄路徑、** 與大括號', () => {
+  const f = (inc, exc) => C.pathFilter(inc, exc);
+  const files = ['a.js', 'src/b.ts', 'src/c.js', 'src/lib/d.min.js', 'test/e.js', 'docs/test.md', 'node/x.json'];
+  const pick = (fn) => files.filter(fn);
+  assert.deepEqual(pick(f('*.js')), ['a.js', 'src/c.js', 'src/lib/d.min.js', 'test/e.js']);
+  assert.deepEqual(pick(f('src/')), ['src/b.ts', 'src/c.js', 'src/lib/d.min.js']);
+  assert.deepEqual(pick(f('src/*.js')), ['src/c.js'], '有 / 時從根目錄比對，* 不跨資料夾');
+  assert.deepEqual(pick(f('src/**/*.js')), ['src/c.js', 'src/lib/d.min.js']);
+  assert.deepEqual(pick(f('*.{ts,md}')), ['src/b.ts', 'docs/test.md']);
+  assert.deepEqual(pick(f('', 'test, *.min.js')), ['a.js', 'src/b.ts', 'src/c.js', 'docs/test.md', 'node/x.json'], 'test 只排除叫 test 的資料夾或檔案');
+  assert.deepEqual(pick(f('*.js, *.json', 'src')), ['a.js', 'test/e.js', 'node/x.json']);
+  assert.deepEqual(C.splitList('*.{js,ts}, a ,,b'), ['*.{js,ts}', 'a', 'b']);
+  assert.ok(f('SRC/')('src/b.ts'), '不分大小寫');
+});

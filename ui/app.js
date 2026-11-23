@@ -1,5 +1,5 @@
 'use strict';
-/* 程式碼編輯器畫面：專案、檔案樹、多分頁編輯（高亮）、Git 異動清單與差異比對 */
+/* 程式碼編輯器畫面：專案、檔案樹、多分頁編輯（高亮）、跨檔案搜尋與取代、Git 異動清單、差異比對、還原與檔案歷史 */
 const td = window.tooldock;
 const C = window.CodeCore;
 const hljs = window.hljs;
@@ -385,6 +385,7 @@ const isDirty = (t) => t.kind === 'file' && !t.unavailable && t.view.text !== t.
 
 function tabIcon(t) {
   if (t.kind === 'diff') return '±';
+  if (t.kind === 'history') return '🕘';
   return '';
 }
 
@@ -554,7 +555,7 @@ async function save(t = activeTab(), as = false) {
     updateStatusBar();
     notice(`已儲存 ${r.name}`);
     refreshGitSoon(300);
-    for (const d of st.tabs) if (d.kind === 'diff' && d.entry.file === file) d.view.load();
+    for (const d of st.tabs) if ((d.kind === 'diff' || d.kind === 'history') && d.entry.file === file) d.view.onFileChanged();
     saveStateSoon();
     return true;
   } catch (err) {
@@ -655,6 +656,11 @@ async function switchProject(id, state) {
   st.gitMap.clear();
   st.gitDirs.clear();
   $('#filter').value = '';
+  srch.query = null;
+  srch.result = null;
+  srch.undo = null;
+  srch.seq++;
+  renderSearch();
   renderProjects();
   const s = state !== undefined ? state : await td.invoke('selectProject', st.pid);
   if (!st.pid) { renderTree(); renderGit(); return; }
@@ -835,9 +841,13 @@ function onTreeContext(e) {
   const items = [];
   if (row && !isDir) items.push(['開啟', () => openFile(absOf(rel))]);
   if (row && !isDir && st.gitMap.has(rel)) items.push(['查看 Git 差異', () => openDiffForRel(rel)]);
+  if (row && !isDir && st.git && st.git.repo && !isUntracked(rel)) items.push(['檔案歷史', () => openHistory(absOf(rel))]);
+  const rv = row && !isDir ? restorableEntry(rel) : null;
+  if (rv) items.push([rv.area === 'untracked' ? '刪除未追蹤的檔案…' : '還原 Git 變更…', () => restoreEntries([rv])]);
   if (items.length) items.push('-');
   items.push(['新增檔案…', () => createIn(dir, false)], ['新增資料夾…', () => createIn(dir, true)]);
   if (row) items.push(['重新命名…', () => renameEntry(rel)]);
+  items.push('-', [isDir && rel ? '在這個資料夾中搜尋…' : '在專案中搜尋…', () => openSearch(false, isDir && rel ? `${rel}/` : undefined)]);
   items.push('-');
   const abs = row ? absOf(rel) : project().root;
   items.push(['複製路徑', () => copyText(abs)]);
@@ -1048,7 +1058,8 @@ function renderGit() {
     const list = g[area];
     if (!list.length) continue;
     const closed = st.gitCollapsed.has(area);
-    rows.push(`<div class="grp-h" data-grp="${area}"><span class="tw">${closed ? '▸' : '▾'}</span>${title}<span class="n">${list.length}</span></div>`);
+    const all = area === 'unstaged' ? '<button class="ib xs" data-rvall="1" title="捨棄全部變更">↶</button>' : area === 'untracked' ? '<button class="ib xs" data-rvall="1" title="刪除全部未追蹤的檔案">↶</button>' : '';
+    rows.push(`<div class="grp-h" data-grp="${area}"><span class="tw">${closed ? '▸' : '▾'}</span>${title}<span class="n">${list.length}</span><span class="acts">${all}</span></div>`);
     if (closed) continue;
     list.forEach((e, i) => {
       const name = basename(e.rel);
@@ -1056,6 +1067,7 @@ function renderGit() {
       const sel = activeDiffKey() === `${area}:${e.path}` ? ' sel' : '';
       rows.push(`<div class="row${sel}" data-area="${area}" data-i="${i}" title="${esc(`${e.rel}（${e.label}${e.orig ? `，原為 ${e.orig}` : ''}）`)}" style="padding-left:20px">`
         + `<span class="ic">${iconFor(name)}</span><span class="nm g-${esc(e.status)}">${esc(name)}</span><span class="dir">${esc(dir)}</span>`
+        + (area === 'unstaged' || area === 'untracked' ? `<span class="acts"><button class="ib xs" data-rv="1" title="${area === 'untracked' ? '刪除未追蹤的檔案' : '捨棄變更（改回暫存區的版本）'}">↶</button></span>` : '')
         + `<span class="gs g-${esc(e.status)}">${e.status === '?' ? 'U' : esc(e.status)}</span></div>`);
     });
   }
@@ -1070,7 +1082,9 @@ function setSide(side) {
   for (const b of $$('#sideTabs button')) b.classList.toggle('on', b.dataset.side === side);
   $('#filesPane').hidden = side !== 'files';
   $('#gitPane').hidden = side !== 'git';
+  $('#searchPane').hidden = side !== 'search';
   if (side === 'git' && !st.git) refreshGit();
+  if (side === 'search') renderSearch();
   saveStateSoon();
 }
 
@@ -1085,70 +1099,87 @@ async function openDiffForRel(rel) {
 
 /* ───────────── 差異比對 ───────────── */
 
-class DiffView {
-  constructor(tab) {
-    this.tab = tab;
+/**
+ * 差異比對的畫面（標頭、左右標籤、內容），Git 異動與檔案歷史共用。
+ * opts：head(pane) 回傳標頭 HTML；onAction(act, btn)；onOpenLine(bLine)；
+ *       canRevert() 為 true 時每段變更有「還原此段」按鈕，按下時呼叫 onRevert(hunk)；sameText() 內容相同時的說明
+ */
+class DiffPane {
+  constructor(el, opts) {
+    this.el = el;
+    this.opts = opts;
     this.expanded = new Set();
-    this.el = document.createElement('div');
-    this.el.className = 'view diff';
-    this.el.innerHTML = `<div class="dhead"></div><div class="dlabels"><div></div><div></div></div><div class="dbody"></div>`;
-    this.head = $('.dhead', this.el);
-    this.body = $('.dbody', this.el);
+    this.data = null;
+    el.classList.add('diff');
+    el.innerHTML = '<div class="dhead"></div><div class="dlabels"><div></div><div></div></div><div class="dbody"></div>';
+    this.head = $('.dhead', el);
+    this.body = $('.dbody', el);
     this.body.addEventListener('click', (e) => {
+      const rv = e.target.closest('.hrev');
+      if (rv) { e.stopPropagation(); Promise.resolve(this.opts.onRevert(this.hunks[Number(rv.dataset.h)])).catch(fail); return; }
       const f = e.target.closest('.fold');
       if (f) { this.expanded.add(Number(f.dataset.start)); this.renderBody(); }
     });
     this.body.addEventListener('dblclick', (e) => {
+      if (e.target.closest('.hrev')) return;
       const r = e.target.closest('.dr[data-b]');
-      if (r && this.tab.entry.area !== 'staged') openFile(this.tab.entry.file, { line: Number(r.dataset.b) + 1 }).catch(fail);
+      if (r && this.opts.onOpenLine) this.opts.onOpenLine(Number(r.dataset.b) + 1);
     });
     this.head.addEventListener('click', (e) => {
       const b = e.target.closest('button');
       if (!b) return;
       if (b.dataset.mode) { this.expanded.clear(); st.diffMode = b.dataset.mode; store.set('diffMode', st.diffMode); this.render(); }
       else if (b.dataset.nav) this.nav(Number(b.dataset.nav));
-      else if (b.dataset.act === 'open') openFile(this.tab.entry.file).catch(fail);
-      else if (b.dataset.act === 'reload') this.load();
+      else if (b.dataset.act && this.opts.onAction) Promise.resolve(this.opts.onAction(b.dataset.act, b)).catch(fail);
     });
-    $('#stage').append(this.el);
   }
 
-  async load() {
-    const e = this.tab.entry;
+  loading() {
+    this.body.className = 'dbody';
     this.body.innerHTML = '<div class="dnote">讀取中…</div>';
-    try {
-      const d = await td.invoke('gitDiff', { id: st.pid, top: st.git.top, area: e.area, path: e.path, orig: e.orig });
-      this.data = d;
-      this.lang = C.langFor(e.path);
-      await ensureLang(this.lang);
-      const a = d.left.text.replace(/\r\n?/g, '\n');
-      const b = d.right.text.replace(/\r\n?/g, '\n');
-      this.a = C.toLines(a);
-      this.b = C.toLines(b);
-      this.ops = C.diffLines(this.a, this.b);
-      this.stats = C.diffStats(this.ops);
-      // 整段高亮後再切行，多行註解與字串才會正確
-      this.ha = C.splitHtmlLines(highlightCode(this.a.join('\n'), this.lang));
-      this.hb = C.splitHtmlLines(highlightCode(this.b.join('\n'), this.lang));
-      this.render();
-    } catch (err) {
-      this.data = null;
-      this.head.innerHTML = '';
-      this.body.innerHTML = `<div class="dnote">無法比對：${esc(err.message)}</div>`;
-    }
+  }
+
+  error(msg) {
+    this.data = null;
+    this.head.innerHTML = '';
+    $('.dlabels', this.el).hidden = true;
+    this.body.className = 'dbody';
+    this.body.innerHTML = `<div class="dnote">${esc(msg)}</div>`;
+  }
+
+  async setData(d, file) {
+    this.lang = C.langFor(file);
+    await ensureLang(this.lang);
+    this.data = d;
+    this.expanded.clear();
+    const a = d.left.text.replace(/\r\n?/g, '\n');
+    const b = d.right.text.replace(/\r\n?/g, '\n');
+    this.a = C.toLines(a);
+    this.b = C.toLines(b);
+    this.ops = C.diffLines(this.a, this.b);
+    this.stats = C.diffStats(this.ops);
+    this.hunks = C.hunks(this.ops);
+    // 整段高亮後再切行，多行註解與字串才會正確
+    this.ha = C.splitHtmlLines(highlightCode(this.a.join('\n'), this.lang));
+    this.hb = C.splitHtmlLines(highlightCode(this.b.join('\n'), this.lang));
+    this.render();
+  }
+
+  /** 標頭共用的部分 */
+  statsHtml() {
+    const s = this.stats;
+    return `<span class="add">+${s.added}</span><span class="del">−${s.removed}</span>`;
+  }
+
+  navHtml() {
+    return `<div class="seg"><button data-mode="sbs" class="${st.diffMode === 'sbs' ? 'on' : ''}">並排</button><button data-mode="uni" class="${st.diffMode === 'uni' ? 'on' : ''}">行內</button></div>`
+      + '<button class="ib sm" data-nav="-1" title="上一個變更">↑</button><button class="ib sm" data-nav="1" title="下一個變更">↓</button>';
   }
 
   render() {
-    const e = this.tab.entry;
     const d = this.data;
     if (!d) return;
-    const s = this.stats;
-    const areaName = Object.fromEntries(GIT_GROUPS)[e.area];
-    this.head.innerHTML = `<span class="p" title="${esc(e.rel)}">${esc(e.rel)}</span><span class="st g-${esc(e.status)}">${esc(areaName)}・${esc(e.label)}</span>`
-      + `<span class="add">+${s.added}</span><span class="del">−${s.removed}</span><span class="sp"></span>`
-      + `<div class="seg"><button data-mode="sbs" class="${st.diffMode === 'sbs' ? 'on' : ''}">並排</button><button data-mode="uni" class="${st.diffMode === 'uni' ? 'on' : ''}">行內</button></div>`
-      + `<button class="ib sm" data-nav="-1" title="上一個變更">↑</button><button class="ib sm" data-nav="1" title="下一個變更">↓</button>`
-      + `${e.status !== 'D' ? '<button class="secondary sm" data-act="open">開啟檔案</button>' : ''}<button class="ib sm" data-act="reload" title="重新整理">⟳</button>`;
+    this.head.innerHTML = this.opts.head(this);
     const labels = $('.dlabels', this.el);
     labels.hidden = st.diffMode !== 'sbs';
     labels.children[0].textContent = `${d.left.label}${d.left.note ? `（${d.left.note}）` : ''}`;
@@ -1159,13 +1190,15 @@ class DiffView {
   renderBody() {
     const d = this.data;
     if (!d) return;
+    this.body.className = 'dbody';
     if (d.left.binary || d.right.binary) { this.body.innerHTML = '<div class="dnote">二進位檔案，無法顯示差異。</div>'; return; }
     if (!this.ops.length) { this.body.innerHTML = '<div class="dnote">檔案是空的。</div>'; return; }
     if (!this.stats.added && !this.stats.removed) {
-      this.body.innerHTML = `<div class="dnote">內容相同${this.tab.entry.status === 'R' ? '（只有重新命名）' : '（可能只有權限或換行字元不同）'}。</div>`;
+      this.body.innerHTML = `<div class="dnote">${esc(this.opts.sameText ? this.opts.sameText() : '內容相同（可能只有權限或換行字元不同）。')}</div>`;
       return;
     }
     const sbs = st.diffMode === 'sbs';
+    const revert = !!(this.opts.canRevert && this.opts.canRevert());
     this.body.className = `dbody ${sbs ? 'sbs' : 'uni'}`;
     const digits = String(Math.max(this.a.length, this.b.length)).length;
     this.body.style.setProperty('--lnw', `calc(${digits}ch + 16px)`);
@@ -1174,24 +1207,27 @@ class DiffView {
     const B = (i) => lineHtml(this.hb[i] || '');
     const out = [];
     let prev = 'eq';
+    let hunk = -1;
     for (const r of rows) {
       if (r.kind === 'fold') { out.push(`<div class="dr fold" data-start="${r.start}"><span>⋯ 展開 ${r.count} 行未變更的內容</span></div>`); prev = 'eq'; continue; }
-      const start = r.kind !== 'eq' && prev === 'eq' ? ' data-chg="1"' : '';
+      const first = r.kind !== 'eq' && prev === 'eq';
+      if (first) hunk++;
+      const start = first ? ` data-chg="1" data-h="${hunk}"` : '';
       const bAttr = r.b !== null ? ` data-b="${r.b}"` : '';
+      const rv = first && revert ? `<button class="hrev" data-h="${hunk}" title="把這一段改回「${esc(d.left.label)}」的內容">↶ 還原此段</button>` : '';
       prev = r.kind;
       if (sbs) {
         const lk = r.kind === 'eq' ? '' : r.a === null ? 'none' : 'del';
         const rk = r.kind === 'eq' ? '' : r.b === null ? 'none' : 'add';
         out.push(`<div class="dr"${start}${bAttr}><span class="n ${lk}">${r.a !== null ? r.a + 1 : ''}</span><span class="c ${lk}">${r.a !== null ? A(r.a) : ''}</span>`
-          + `<span class="n ${rk}">${r.b !== null ? r.b + 1 : ''}</span><span class="c ${rk}">${r.b !== null ? B(r.b) : ''}</span></div>`);
+          + `<span class="n ${rk}">${r.b !== null ? r.b + 1 : ''}</span><span class="c ${rk}">${r.b !== null ? B(r.b) : ''}</span>${rv}</div>`);
       } else {
         const k = r.kind === 'eq' ? '' : r.kind;
         out.push(`<div class="dr"${start}${bAttr}><span class="n ${k}">${r.a !== null ? r.a + 1 : ''}</span><span class="n ${k}">${r.b !== null ? r.b + 1 : ''}</span>`
-          + `<span class="s ${k}">${r.kind === 'del' ? '−' : r.kind === 'add' ? '+' : ''}</span><span class="c ${k}">${r.kind === 'del' ? A(r.a) : B(r.b)}</span></div>`);
+          + `<span class="s ${k}">${r.kind === 'del' ? '−' : r.kind === 'add' ? '+' : ''}</span><span class="c ${k}">${r.kind === 'del' ? A(r.a) : B(r.b)}</span>${rv}</div>`);
       }
     }
     this.body.innerHTML = out.join('');
-    this.focusIdx = -1;
   }
 
   /** 跳到上一個／下一個變更 */
@@ -1210,7 +1246,57 @@ class DiffView {
     this.body.scrollTop = Math.max(0, chg[i].offsetTop - 60);
     notice(`第 ${i + 1} / ${chg.length} 處變更`);
   }
+}
 
+/** Git 異動的比對分頁 */
+class DiffView {
+  constructor(tab) {
+    this.tab = tab;
+    this.el = document.createElement('div');
+    this.el.className = 'view';
+    $('#stage').append(this.el);
+    this.pane = new DiffPane(this.el, {
+      head: (p) => this.headHtml(p),
+      onAction: (act) => this.action(act),
+      onOpenLine: (line) => { if (this.tab.entry.area !== 'staged') openFile(this.tab.entry.file, { line }).catch(fail); },
+      canRevert: () => this.tab.entry.area === 'unstaged' && !!this.pane.data && this.pane.data.left.exists && this.pane.data.right.exists,
+      onRevert: (h) => revertHunk(this.tab, h),
+      sameText: () => (this.tab.entry.status === 'R' ? '內容相同（只有重新命名）。' : '內容相同（可能只有權限或換行字元不同）。'),
+    });
+  }
+
+  async load() {
+    const e = this.tab.entry;
+    this.pane.loading();
+    try {
+      const d = await td.invoke('gitDiff', { id: st.pid, top: st.git.top, area: e.area, path: e.path, orig: e.orig });
+      await this.pane.setData(d, e.path);
+    } catch (err) {
+      this.pane.error(`無法比對：${err.message}`);
+    }
+  }
+
+  headHtml(p) {
+    const e = this.tab.entry;
+    const areaName = Object.fromEntries(GIT_GROUPS)[e.area];
+    const restore = e.area === 'unstaged' ? '<button class="secondary sm" data-act="restore" title="捨棄工作目錄的變更，改回暫存區的版本">↶ 還原檔案…</button>'
+      : e.area === 'untracked' ? '<button class="secondary sm" data-act="restore" title="刪除這個未追蹤的檔案">刪除檔案…</button>' : '';
+    return `<span class="p" title="${esc(e.rel)}">${esc(e.rel)}</span><span class="st g-${esc(e.status)}">${esc(areaName)}・${esc(e.label)}</span>`
+      + `${p.statsHtml()}<span class="sp"></span>${p.navHtml()}${restore}`
+      + `${e.status !== 'D' ? '<button class="secondary sm" data-act="open">開啟檔案</button>' : ''}`
+      + `${e.area !== 'untracked' ? '<button class="ib sm" data-act="history" title="檔案歷史">🕘</button>' : ''}<button class="ib sm" data-act="reload" title="重新整理">⟳</button>`;
+  }
+
+  action(act) {
+    const e = this.tab.entry;
+    if (act === 'open') return openFile(e.file);
+    if (act === 'reload') return this.load();
+    if (act === 'restore') return restoreEntries([e]);
+    if (act === 'history') return openHistory(e.file);
+    return null;
+  }
+
+  onFileChanged() { return this.load(); }
   saveViewState() { return null; }
   destroy() { this.el.remove(); }
 }
@@ -1352,6 +1438,736 @@ function replaceAll() {
   refreshFind();
 }
 
+/* ───────────── 改寫硬碟檔案之後：重新載入與復原 ───────────── */
+
+/** 尚未儲存的分頁不能被取代或還原蓋掉 */
+function guardDirty(files) {
+  const t = st.tabs.find((x) => x.kind === 'file' && files.includes(x.file) && isDirty(x));
+  if (!t) return true;
+  activate(t.id);
+  notice(`「${t.name}」有尚未儲存的變更，請先儲存或放棄修改再操作`, 'err');
+  return false;
+}
+
+/** 擴充改寫了硬碟上的檔案：重新載入沒有修改過的分頁、關閉被刪除檔案的分頁，重新整理比對、檔案樹與 Git */
+async function afterDiskChange(changed) {
+  const set = new Set(changed);
+  if (!set.size) return;
+  for (const t of [...st.tabs]) {
+    if (t.kind !== 'file' || !t.file || !set.has(t.file)) continue;
+    const s = await td.invoke('stat', t.file).catch(() => null);
+    if (!s) { if (!isDirty(t)) await closeTab(t.id, true); continue; }
+    if (isDirty(t)) { checkExternal(t); continue; }
+    const vs = t.view.saveViewState && t.view.saveViewState();
+    try {
+      fillDoc(t, await td.invoke('read', t.file));
+      if (vs) t.view.restoreViewState(vs);
+    } catch { /* 檔案讀不到時留給下次檢查 */ }
+  }
+  for (const t of st.tabs) if ((t.kind === 'diff' || t.kind === 'history') && set.has(t.entry.file)) t.view.onFileChanged();
+  st.fileList = null;
+  await loadTree();
+  renderTabs();
+  updateStatusBar();
+  await refreshGit();
+}
+
+/** 操作結果的提示列；undoId 有值時附上「復原」 */
+function resultBanner(msg, undoId, failures = []) {
+  const why = failures.length
+    ? `　${failures.length} 個沒有完成：${failures.slice(0, 2).map((f) => `${basename(f.path || f.file)}（${f.reason}）`).join('、')}${failures.length > 2 ? '…' : ''}`
+    : '';
+  const acts = [];
+  if (undoId) acts.push(['↶ 復原', () => undoOp(undoId).catch(fail), 'primary']);
+  acts.push(['關閉', () => {}]);
+  banner(msg + why, acts);
+}
+
+async function undoOp(id) {
+  const r = await td.invoke('undo', id);
+  if (srch.undo && srch.undo.id === id) srch.undo = null;
+  await afterDiskChange(r.restored);
+  if (r.skipped.length) resultBanner(`已復原 ${r.restored.length} 個檔案。`, null, r.skipped);
+  else { banner(''); notice(`已復原「${r.label}」（${r.restored.length} 個檔案）`); }
+  if (srch.query) await runSearch();
+  else renderSearchBar();
+  return r;
+}
+
+/* ───────────── 跨檔案搜尋與取代 ───────────── */
+
+const srch = {
+  caseSens: false,
+  word: false,
+  regex: false,
+  showRep: false,
+  more: false,
+  query: null, // 目前結果使用的搜尋條件
+  result: null, // { files: [{ rel, file, readOnly, matches: [{ ..., off }], collapsed }], total, truncated, tooMany, error }
+  running: false,
+  seq: 0,
+  undo: null, // { id, label }
+  sel: -1, // 鍵盤選取的列
+};
+const collator = new Intl.Collator('zh-Hant', { numeric: true, sensitivity: 'base' });
+const SEARCH_PREFS = ['caseSens', 'word', 'regex', 'showRep', 'more'];
+
+function loadSearchPrefs() {
+  const p = store.get('search', {});
+  for (const k of SEARCH_PREFS) if (typeof p[k] === 'boolean') srch[k] = p[k];
+  $('#sInclude').value = p.include || '';
+  $('#sExclude').value = p.exclude || '';
+  syncSearchForm();
+}
+
+function saveSearchPrefs() {
+  const p = { include: $('#sInclude').value, exclude: $('#sExclude').value };
+  for (const k of SEARCH_PREFS) p[k] = srch[k];
+  store.set('search', p);
+}
+
+function syncSearchForm() {
+  $('#sCase').classList.toggle('on', srch.caseSens);
+  $('#sWord').classList.toggle('on', srch.word);
+  $('#sRegex').classList.toggle('on', srch.regex);
+  $('#sRepRow').hidden = !srch.showRep;
+  $('#sRepToggle').textContent = srch.showRep ? '▾' : '▸';
+  $('#sMore').hidden = !srch.more;
+  $('#sMoreBtn').textContent = `${srch.more ? '▾' : '▸'} 檔案篩選${!srch.more && ($('#sInclude').value || $('#sExclude').value) ? '（使用中）' : ''}`;
+}
+
+const searchOpts = () => ({
+  query: $('#sQuery').value,
+  regex: srch.regex,
+  caseSens: srch.caseSens,
+  word: srch.word,
+  include: $('#sInclude').value,
+  exclude: $('#sExclude').value,
+});
+
+/** 專案內已開啟的檔案分頁（以編輯器中的內容搜尋與取代） */
+function openFileTabs() {
+  const m = new Map();
+  for (const t of st.tabs) {
+    if (t.kind !== 'file' || !t.file || t.unavailable) continue;
+    const rel = relOf(t.file);
+    if (rel !== null) m.set(rel, t);
+  }
+  return m;
+}
+
+function searchBuffer(t, rel, re, regex, limit = 5000) {
+  const r = C.findInText(t.view.text, re, { limit, groups: regex });
+  return { rel, file: t.file, readOnly: t.readOnly ? t.encoding : '', matches: r.matches };
+}
+
+let searchTimer = null;
+function runSearchSoon(ms = 350) { clearTimeout(searchTimer); searchTimer = setTimeout(() => runSearch().catch(fail), ms); }
+
+async function runSearch() {
+  clearTimeout(searchTimer);
+  const o = searchOpts();
+  const seq = ++srch.seq;
+  srch.sel = -1;
+  if (!o.query || !st.pid) {
+    srch.query = null;
+    srch.result = null;
+    srch.running = false;
+    $('#sQuery').classList.remove('bad');
+    td.invoke('cancelSearch').catch(() => {});
+    renderSearch();
+    return;
+  }
+  let re;
+  try {
+    re = C.searchRegex(o);
+    $('#sQuery').classList.remove('bad');
+  } catch (err) {
+    $('#sQuery').classList.add('bad');
+    srch.result = { error: `規則運算式有誤：${err.message}` };
+    srch.running = false;
+    renderSearch();
+    return;
+  }
+  srch.running = true;
+  renderSearchBar();
+  const open = openFileTabs();
+  const keep = C.pathFilter(o.include, o.exclude);
+  try {
+    const r = await td.invoke('search', { id: st.pid, ...o, skip: [...open.keys()] });
+    if (seq !== srch.seq || r.canceled) return;
+    const list = [...r.files];
+    let total = r.total;
+    for (const [rel, t] of open) {
+      if (!keep(rel)) continue;
+      const f = searchBuffer(t, rel, re, o.regex);
+      if (f.matches.length) { list.push(f); total += f.matches.length; }
+    }
+    list.sort((a, b) => collator.compare(a.rel, b.rel));
+    srch.query = o;
+    srch.result = { ...r, files: list, total };
+  } catch (err) {
+    if (seq === srch.seq) srch.result = { error: err.message };
+  } finally {
+    if (seq === srch.seq) {
+      srch.running = false;
+      renderSearch();
+    }
+  }
+}
+
+/** 重新搜尋單一檔案（取代之後更新清單） */
+async function searchOneFile(f) {
+  const q = srch.query;
+  const t = st.tabs.find((x) => x.kind === 'file' && x.file === f.file && !x.unavailable);
+  if (t) return searchBuffer(t, f.rel, C.searchRegex(q), q.regex).matches;
+  const r = await td.invoke('search', { id: st.pid, ...q, only: [f.rel] });
+  return r.files && r.files[0] ? r.files[0].matches : [];
+}
+
+const countAll = () => (srch.result && srch.result.files ? srch.result.files.reduce((n, f) => n + f.matches.length, 0) : 0);
+const countSelected = () => (srch.result && srch.result.files ? srch.result.files.reduce((n, f) => n + (f.readOnly ? 0 : f.matches.filter((m) => !m.off).length), 0) : 0);
+
+function renderSearch() {
+  renderSearchBar();
+  renderSearchResults();
+}
+
+function renderSearchBar() {
+  const bar = $('#sBar');
+  const r = srch.result;
+  if (!st.pid) { bar.innerHTML = ''; return; }
+  let msg = '';
+  if (srch.running) msg = '搜尋中…';
+  else if (r && r.error) msg = `<span class="err">${esc(r.error)}</span>`;
+  else if (r) {
+    const n = countAll();
+    msg = n ? `${r.files.length.toLocaleString()} 個檔案中有 ${n.toLocaleString()} 筆結果` : '沒有結果';
+    if (r.truncated) msg += `<br><span class="warn">結果太多，只列出前 ${r.total.toLocaleString()} 筆，請縮小搜尋範圍</span>`;
+    if (r.tooMany) msg += '<br><span class="warn">專案檔案太多，只搜尋了一部分</span>';
+    const sk = r.skipped || {};
+    if (sk.large) msg += `<br><span class="faint">略過 ${sk.large} 個超過 10 MB 的檔案</span>`;
+  }
+  const acts = r && r.files && r.files.length
+    ? '<button class="ib sm" data-sact="collapseAll" title="全部收合／展開">⊟</button><button class="ib sm" data-sact="clear" title="清除結果">✕</button>' : '';
+  const sel = countSelected();
+  let html = msg || acts ? `<div class="sline"><span class="smsg">${msg}</span>${acts}</div>` : '';
+  if (srch.showRep && r && r.files && r.files.length) {
+    html += `<div class="sline"><button class="sm" data-sact="replaceSel" ${sel ? '' : 'disabled'}>取代所選（${sel.toLocaleString()}）</button>`
+      + '<button class="ib sm" data-sact="checkAll" title="全選">☑</button><button class="ib sm" data-sact="checkNone" title="全不選">☐</button></div>';
+  }
+  if (srch.undo) html += `<div class="sline"><button class="secondary sm" data-sact="undo" title="${esc(srch.undo.label)}">↶ 復原上次取代</button><span class="smsg faint">${esc(srch.undo.label)}</span></div>`;
+  bar.innerHTML = html;
+}
+
+const oneLine = (s) => String(s).replace(/\n/g, '↵');
+
+function matchPreview(m, rep) {
+  const before = m.cut ? `…${m.before}` : m.before.replace(/^\s+/, '');
+  const shown = m.multi ? `${m.text.split('\n')[0]}↵…` : m.text;
+  const hit = rep === null
+    ? `<mark>${esc(shown)}</mark>`
+    : `<del>${esc(shown)}</del><ins>${esc(oneLine(C.expandReplacement(rep, m, srch.query.regex)))}</ins>`;
+  return `${esc(before)}${hit}${esc(m.after)}`;
+}
+
+function renderSearchResults() {
+  const box = $('#sResults');
+  const r = srch.result;
+  if (!st.pid) { box.innerHTML = '<div class="empty-msg">建立專案後，可以在整個專案中搜尋與取代。</div>'; return; }
+  if (!r || r.error || !r.files) {
+    box.innerHTML = r ? '' : '<div class="empty-msg">輸入要搜尋的文字。<br>展開左邊的 ▸ 可以取代：結果會先列出來，確認後再逐一或勾選取代。</div>';
+    return;
+  }
+  const rep = srch.showRep ? $('#sReplace').value : null;
+  const dirty = new Set(st.tabs.filter(isDirty).map((t) => t.file));
+  const rows = [];
+  let row = 0;
+  r.files.forEach((f, fi) => {
+    const on = f.matches.filter((m) => !m.off).length;
+    const name = basename(f.rel);
+    const canRep = srch.showRep && !f.readOnly;
+    rows.push(`<div class="row sfile${row++ === srch.sel ? ' sel' : ''}" data-f="${fi}" title="${esc(f.rel)}">`
+      + `<span class="tw">${f.collapsed ? '▸' : '▾'}</span>`
+      + (srch.showRep ? `<input type="checkbox" class="sck" ${on ? 'checked' : ''} ${f.readOnly ? 'disabled' : ''} data-part="${on && on < f.matches.length ? 1 : ''}">` : '')
+      + `<span class="ic">${iconFor(name)}</span><span class="nm">${esc(name)}</span><span class="dir">${esc(dirname(f.rel))}</span>`
+      + (f.readOnly ? `<span class="lock" title="${esc(String(f.readOnly).toUpperCase())} 編碼的檔案為唯讀，不能取代">🔒</span>` : '')
+      + (dirty.has(f.file) ? '<span class="dmark" title="已開啟且尚未儲存：取代會改在編輯器中，不會寫入硬碟">●</span>' : '')
+      + `<span class="cnt">${f.matches.length}</span>`
+      + `<span class="acts">${canRep ? '<button class="ib xs" data-sact="repFile" title="取代這個檔案中勾選的項目">⇄</button>' : ''}<button class="ib xs" data-sact="dismissFile" title="從清單移除">✕</button></span></div>`);
+    if (f.collapsed) return;
+    f.matches.forEach((m, mi) => {
+      rows.push(`<div class="row smatch${m.off ? ' off' : ''}${row++ === srch.sel ? ' sel' : ''}" data-f="${fi}" data-m="${mi}" title="第 ${m.line} 行，第 ${m.col} 欄">`
+        + (srch.showRep ? `<input type="checkbox" class="sck" ${m.off ? '' : 'checked'} ${f.readOnly ? 'disabled' : ''}>` : '')
+        + `<span class="pv">${matchPreview(m, rep)}</span><span class="ln">${m.line}</span>`
+        + `<span class="acts">${canRep ? '<button class="ib xs" data-sact="repOne" title="取代這一處">⇄</button>' : ''}<button class="ib xs" data-sact="dismiss" title="從清單移除">✕</button></span></div>`);
+    });
+  });
+  box.innerHTML = rows.join('');
+  for (const c of $$('.sck[data-part="1"]', box)) c.indeterminate = true;
+}
+
+/** 在編輯器開啟符合的位置並選取 */
+async function openMatch(f, m, preview = true) {
+  const t = await openFile(f.file, { preview });
+  if (!t || t.unavailable) return;
+  const ta = t.view.ta;
+  if (ta.value.slice(m.start, m.end) === m.text) {
+    t.view.focus();
+    ta.setSelectionRange(m.start, m.end);
+    t.view.onCaret();
+    t.view.reveal(true);
+    t.view.markHit(t.view.caretLine());
+  } else {
+    t.view.gotoLine(m.line, m.col);
+  }
+}
+
+/** 只改變不同的那一段（一個 ⌘Z 就能復原整次取代） */
+function applySpanEdit(view, old, out) {
+  const max = Math.min(old.length, out.length);
+  let s = 0;
+  while (s < max && old[s] === out[s]) s++;
+  let e = 0;
+  while (e < max - s && old[old.length - 1 - e] === out[out.length - 1 - e]) e++;
+  const insert = out.slice(s, out.length - e);
+  applyEdit(view, { from: s, to: old.length - e, insert, selStart: s, selEnd: s + insert.length });
+}
+
+/**
+ * 取代：targets = [{ f, ms }]。
+ * 已開啟且尚未儲存的檔案改在編輯器中取代（可用 ⌘Z 復原）；其餘寫入硬碟（可按「復原上次取代」還原）。
+ */
+async function replaceTargets(targets, { confirm = false } = {}) {
+  const q = srch.query;
+  if (!q) return;
+  const rep = $('#sReplace').value;
+  targets = targets.map((x) => ({ f: x.f, ms: x.ms })).filter((x) => x.ms.length && !x.f.readOnly);
+  const n = targets.reduce((s, x) => s + x.ms.length, 0);
+  if (!n) { notice('沒有勾選要取代的項目'); return; }
+  if (confirm && (targets.length > 1 || n > 1)) {
+    const r = await td.dialog.message({
+      type: 'question',
+      message: `要在 ${targets.length.toLocaleString()} 個檔案中取代 ${n.toLocaleString()} 處嗎？`,
+      detail: `「${oneLine(q.query)}」→「${oneLine(rep)}」\n\n沒有在編輯器中修改過的檔案會直接寫入硬碟，之後可以按「復原上次取代」還原；已開啟且尚未儲存的檔案會改在編輯器中取代，可以用 ${MOD}Z 復原。`,
+      buttons: ['取代', '取消'], defaultId: 0, cancelId: 1,
+    });
+    if (r.response !== 0) return;
+  }
+  const jobs = targets.map((x) => {
+    const reps = x.ms.map((m) => ({ start: m.start, end: m.end, text: m.text, replacement: C.expandReplacement(rep, m, q.regex) }));
+    const t = st.tabs.find((tt) => tt.kind === 'file' && tt.file === x.f.file && !tt.unavailable);
+    return { ...x, reps, t, inBuffer: !!t && isDirty(t), done: false, reason: '' };
+  });
+  // 編輯器中：要切到那個分頁才能用 execCommand（才會進入復原記錄）
+  const back = st.active;
+  for (const j of jobs.filter((x) => x.inBuffer)) {
+    const old = j.t.view.text;
+    const out = C.applyReplacements(old, j.reps);
+    if (out === null) { j.reason = '內容在搜尋之後被修改過，請重新搜尋'; continue; }
+    if (st.active !== j.t.id) activate(j.t.id);
+    applySpanEdit(j.t.view, old, out);
+    j.done = true;
+  }
+  if (back && st.active !== back && st.tabs.some((t) => t.id === back)) activate(back);
+  const disk = jobs.filter((x) => !x.inBuffer);
+  if (disk.length) {
+    const label = `「${oneLine(q.query)}」→「${oneLine(rep)}」`;
+    const r = await td.invoke('replaceInFiles', { id: st.pid, label, items: disk.map((j) => ({ file: j.f.file, reps: j.reps })) });
+    r.results.forEach((res, i) => { if (res.ok) disk[i].done = true; else disk[i].reason = res.reason; });
+    if (r.undoId) srch.undo = { id: r.undoId, label: `${label}（${r.results.filter((x) => x.ok).length} 個檔案）` };
+    await afterDiskChange(disk.filter((j) => j.done).map((j) => j.f.file));
+  }
+  for (const j of jobs.filter((x) => x.done)) await refreshSearchFile(j.f, j.reps);
+  const done = jobs.filter((x) => x.done);
+  const count = done.reduce((s, j) => s + j.reps.length, 0);
+  const buf = done.filter((j) => j.inBuffer).length;
+  const failed = jobs.filter((x) => !x.done).map((j) => ({ file: j.f.file, reason: j.reason }));
+  renderSearch();
+  if (failed.length) resultBanner(`已取代 ${count.toLocaleString()} 處。`, null, failed);
+  else notice(`已取代 ${count.toLocaleString()} 處（${done.length} 個檔案${buf ? `，其中 ${buf} 個在編輯器中、尚未儲存` : ''}）`);
+}
+
+/**
+ * 取代之後更新那個檔案的結果：重新搜尋，只保留原本還在清單上、沒有被取代的項目（位置依取代的長度調整），
+ * 沒有勾選的維持不勾選。
+ */
+async function refreshSearchFile(f, reps) {
+  const r = srch.result;
+  if (!r || !r.files) return;
+  const sorted = [...reps].sort((a, b) => a.start - b.start);
+  const replaced = new Set(sorted.map((x) => x.start));
+  const shift = (pos) => {
+    let d = 0;
+    for (const x of sorted) if (x.start < pos) d += x.replacement.length - (x.end - x.start);
+    return pos + d;
+  };
+  const on = new Set();
+  const off = new Set();
+  for (const m of f.matches) if (!replaced.has(m.start)) (m.off ? off : on).add(shift(m.start));
+  let fresh = [];
+  try { fresh = await searchOneFile(f); } catch { /* 讀不到就清掉 */ }
+  f.matches = fresh.filter((m) => on.has(m.start) || off.has(m.start));
+  for (const m of f.matches) m.off = off.has(m.start);
+  if (!f.matches.length) r.files = r.files.filter((x) => x !== f);
+}
+
+function searchRowAt(el) {
+  const row = el.closest('.row[data-f]');
+  if (!row || !srch.result || !srch.result.files) return null;
+  const f = srch.result.files[Number(row.dataset.f)];
+  if (!f) return null;
+  const m = row.dataset.m !== undefined ? f.matches[Number(row.dataset.m)] : null;
+  return { row, f, m };
+}
+
+function onSearchClick(e, dbl) {
+  const hit = searchRowAt(e.target);
+  const act = e.target.closest('[data-sact]');
+  if (!hit) return;
+  const { f, m } = hit;
+  srch.sel = $$('#sResults .row').indexOf(hit.row);
+  if (e.target.classList.contains('sck')) {
+    const v = e.target.checked;
+    if (m) m.off = !v; else for (const x of f.matches) x.off = !v;
+    renderSearch();
+    return;
+  }
+  if (act) {
+    const a = act.dataset.sact;
+    if (a === 'repOne') replaceTargets([{ f, ms: [m] }]).catch(fail);
+    else if (a === 'repFile') replaceTargets([{ f, ms: f.matches.filter((x) => !x.off) }]).catch(fail);
+    else if (a === 'dismiss') { f.matches = f.matches.filter((x) => x !== m); if (!f.matches.length) srch.result.files = srch.result.files.filter((x) => x !== f); renderSearch(); }
+    else if (a === 'dismissFile') { srch.result.files = srch.result.files.filter((x) => x !== f); renderSearch(); }
+    return;
+  }
+  if (!m) { f.collapsed = !f.collapsed; renderSearchResults(); return; }
+  markSearchSel();
+  openMatch(f, m, !dbl).catch(fail);
+}
+
+function onSearchBarClick(e) {
+  const b = e.target.closest('[data-sact]');
+  if (!b || !srch.result) return;
+  const a = b.dataset.sact;
+  const files = srch.result.files || [];
+  if (a === 'clear') { $('#sQuery').value = ''; runSearch().catch(fail); }
+  else if (a === 'collapseAll') { const c = !files.every((f) => f.collapsed); for (const f of files) f.collapsed = c; renderSearchResults(); }
+  else if (a === 'checkAll' || a === 'checkNone') { for (const f of files) for (const m of f.matches) m.off = a === 'checkNone'; renderSearch(); }
+  else if (a === 'replaceSel') replaceTargets(files.map((f) => ({ f, ms: f.matches.filter((m) => !m.off) })), { confirm: true }).catch(fail);
+  else if (a === 'undo' && srch.undo) undoOp(srch.undo.id).catch(fail);
+}
+
+function markSearchSel() {
+  const rows = $$('#sResults .row');
+  rows.forEach((r, i) => r.classList.toggle('sel', i === srch.sel));
+  if (rows[srch.sel]) rows[srch.sel].scrollIntoView({ block: 'nearest' });
+}
+
+function onSearchKey(e) {
+  const rows = $$('#sResults .row');
+  if (!rows.length) return;
+  const cur = rows[srch.sel];
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    srch.sel = Math.max(0, Math.min(rows.length - 1, srch.sel + (e.key === 'ArrowDown' ? 1 : -1)));
+    markSearchSel();
+    const hit = searchRowAt(rows[srch.sel]);
+    if (hit && hit.m) openMatch(hit.f, hit.m, true).then(() => $('#sResults').focus()).catch(fail);
+  } else if (cur && e.key === 'Enter') {
+    e.preventDefault();
+    const hit = searchRowAt(cur);
+    if (!hit) return;
+    if (hit.m) openMatch(hit.f, hit.m, false).catch(fail);
+    else { hit.f.collapsed = !hit.f.collapsed; renderSearchResults(); }
+  } else if (cur && e.key === ' ' && srch.showRep) {
+    e.preventDefault();
+    const hit = searchRowAt(cur);
+    if (!hit || hit.f.readOnly) return;
+    if (hit.m) hit.m.off = !hit.m.off;
+    else { const v = hit.f.matches.some((m) => m.off); for (const m of hit.f.matches) m.off = !v; }
+    renderSearch();
+  } else if (cur && (e.key === 'Delete' || e.key === 'Backspace')) {
+    e.preventDefault();
+    const hit = searchRowAt(cur);
+    if (!hit) return;
+    if (hit.m) { hit.f.matches = hit.f.matches.filter((x) => x !== hit.m); if (!hit.f.matches.length) srch.result.files = srch.result.files.filter((x) => x !== hit.f); }
+    else srch.result.files = srch.result.files.filter((x) => x !== hit.f);
+    renderSearch();
+    srch.sel = Math.min(srch.sel, $$('#sResults .row').length - 1);
+    markSearchSel();
+  }
+}
+
+/** ⌘⇧F／⌘⇧H：切到搜尋分頁，選取的文字（單行）帶入搜尋框 */
+function openSearch(replace, include) {
+  setSide('search');
+  if (replace && !srch.showRep) { srch.showRep = true; syncSearchForm(); saveSearchPrefs(); renderSearch(); }
+  if (include !== undefined) { $('#sInclude').value = include; srch.more = true; syncSearchForm(); saveSearchPrefs(); }
+  const t = codeTab();
+  const q = $('#sQuery');
+  if (t) {
+    const ta = t.view.ta;
+    const sel = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+    if (sel && !sel.includes('\n') && sel.length < 200) q.value = srch.regex ? sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : sel;
+  }
+  const input = replace && q.value ? $('#sReplace') : q;
+  input.focus();
+  input.select();
+  if (q.value && (include !== undefined || !srch.query || srch.query.query !== q.value)) runSearch().catch(fail);
+}
+
+function bindSearch() {
+  const q = $('#sQuery');
+  q.addEventListener('input', () => runSearchSoon());
+  q.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); runSearch().catch(fail); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); $('#sResults').focus(); srch.sel = Math.max(0, srch.sel); markSearchSel(); }
+  });
+  let rt = null;
+  $('#sReplace').addEventListener('input', () => { clearTimeout(rt); rt = setTimeout(renderSearchResults, 120); });
+  $('#sReplace').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    const files = srch.result && srch.result.files;
+    if (files && files.length) replaceTargets(files.map((f) => ({ f, ms: f.matches.filter((m) => !m.off) })), { confirm: true }).catch(fail);
+  });
+  for (const [id, key] of [['#sCase', 'caseSens'], ['#sWord', 'word'], ['#sRegex', 'regex']]) {
+    $(id).onclick = () => { srch[key] = !srch[key]; syncSearchForm(); saveSearchPrefs(); runSearch().catch(fail); };
+  }
+  $('#sRepToggle').onclick = () => { srch.showRep = !srch.showRep; syncSearchForm(); saveSearchPrefs(); renderSearch(); if (srch.showRep) $('#sReplace').focus(); };
+  $('#sMoreBtn').onclick = () => { srch.more = !srch.more; syncSearchForm(); saveSearchPrefs(); if (srch.more) $('#sInclude').focus(); };
+  for (const id of ['#sInclude', '#sExclude']) {
+    $(id).addEventListener('input', () => { saveSearchPrefs(); runSearchSoon(500); });
+    $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch().catch(fail); } });
+  }
+  const res = $('#sResults');
+  res.addEventListener('click', (e) => onSearchClick(e, false));
+  res.addEventListener('dblclick', (e) => { if (!e.target.closest('[data-sact], .sck')) onSearchClick(e, true); });
+  res.addEventListener('keydown', onSearchKey);
+  res.addEventListener('contextmenu', (e) => {
+    const hit = searchRowAt(e.target);
+    if (!hit) return;
+    const { f, m } = hit;
+    const items = [];
+    if (m) items.push(['開啟', () => openMatch(f, m, false)]);
+    if (srch.showRep && !f.readOnly) {
+      if (m) items.push(['取代這一處', () => replaceTargets([{ f, ms: [m] }])]);
+      items.push(['取代這個檔案中勾選的項目', () => replaceTargets([{ f, ms: f.matches.filter((x) => !x.off) }])]);
+    }
+    items.push('-', ['從清單移除', () => {
+      if (m) f.matches = f.matches.filter((x) => x !== m);
+      if (!m || !f.matches.length) srch.result.files = srch.result.files.filter((x) => x !== f);
+      renderSearch();
+    }]);
+    items.push('-', ['複製路徑', () => copyText(f.file)], ['複製相對路徑', () => copyText(f.rel)]);
+    contextMenu(e, items);
+  });
+  $('#sBar').addEventListener('click', onSearchBarClick);
+}
+
+/* ───────────── Git 還原 ───────────── */
+
+/** 檔案在「變更」或「未追蹤」中的項目（可以還原的） */
+function restorableEntry(rel) {
+  const g = st.git;
+  if (!g || !g.repo || rel === null) return null;
+  return g.unstaged.find((x) => x.rel === rel) || g.untracked.find((x) => x.rel === rel) || null;
+}
+
+const isUntracked = (rel) => !!(st.git && st.git.repo && st.git.untracked.some((x) => x.rel === rel));
+
+/** 捨棄工作目錄的變更（變更 → 暫存區的版本；未追蹤 → 刪除），先確認 */
+async function restoreEntries(entries) {
+  entries = entries.filter((e) => e && (e.area === 'unstaged' || e.area === 'untracked'));
+  if (!entries.length || !st.git || !st.git.repo) return;
+  if (!guardDirty(entries.map((e) => e.file))) return;
+  const un = entries.filter((e) => e.area === 'untracked').length;
+  const tr = entries.length - un;
+  const one = entries.length === 1 ? basename(entries[0].rel) : '';
+  const onlyDelete = un && !tr;
+  const message = one
+    ? (un ? `要刪除未追蹤的檔案「${one}」嗎？` : `要捨棄「${one}」的變更嗎？`)
+    : onlyDelete ? `要刪除 ${un} 個未追蹤的檔案嗎？` : `要還原 ${entries.length} 個檔案嗎？`;
+  const detail = [
+    tr ? '工作目錄的修改會被捨棄，改回暫存區的版本（沒有 git add 過時，就是最近一次提交的版本）。已暫存的變更不受影響。' : '',
+    un ? '未追蹤的檔案會被刪除（不會移到垃圾桶）。' : '',
+    '還原後可以按「復原」改回來（只在這次開啟 ToolDock 期間有效）。',
+  ].filter(Boolean).join('\n\n');
+  const ans = await td.dialog.message({ type: 'warning', message, detail, buttons: [onlyDelete ? '刪除' : '還原', '取消'], defaultId: 1, cancelId: 1 });
+  if (ans.response !== 0) return;
+  const r = await td.invoke('gitRestore', { id: st.pid, top: st.git.top, items: entries.map((e) => ({ area: e.area, path: e.path })) });
+  const ok = entries.filter((_, i) => r.results[i] && r.results[i].ok);
+  for (const e of ok) {
+    const d = st.tabs.find((t) => t.kind === 'diff' && t.entry.area === e.area && t.entry.path === e.path);
+    if (d) await closeTab(d.id, true);
+  }
+  await afterDiskChange(ok.map((e) => e.file));
+  const what = ok.length === 1 ? basename(ok[0].rel) : `${ok.length} 個檔案`;
+  resultBanner(ok.length ? `已${onlyDelete ? '刪除' : '還原'} ${what}。` : '沒有還原任何檔案。', r.undoId, r.results.filter((x) => !x.ok));
+}
+
+/** 比對中的「還原此段」 */
+async function revertHunk(tab, h) {
+  const e = tab.entry;
+  if (!h || !guardDirty([e.file])) return;
+  const r = await td.invoke('gitRevertHunk', { id: st.pid, top: st.git.top, path: e.path, hunk: h });
+  await afterDiskChange([e.file]);
+  resultBanner(`已還原 ${basename(e.rel)} 的一段變更。`, r.undoId);
+}
+
+/* ───────────── 檔案歷史 ───────────── */
+
+const fmtTime = (ms) => new Date(ms).toLocaleString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+
+/** 儲存庫相對路徑（不在儲存庫內時回傳 null） */
+function repoRel(file) {
+  const top = st.git && st.git.repo ? st.git.top : null;
+  if (!top || !file) return null;
+  const sep = st.info.sep;
+  const root = top.endsWith(sep) ? top : top + sep;
+  if (!file.startsWith(root)) return null;
+  return file.slice(root.length).split(sep).join('/');
+}
+
+async function openHistory(file) {
+  if (!st.git) await refreshGit();
+  if (!st.git || !st.git.repo) { notice('這個專案不是 Git 儲存庫'); return null; }
+  const path = repoRel(file);
+  if (path === null) { notice('檔案不在儲存庫內'); return null; }
+  let t = st.tabs.find((x) => x.kind === 'history' && x.entry.file === file);
+  if (t) { activate(t.id); return t; }
+  const rel = relOf(file) ?? path;
+  t = addTab({ kind: 'history', file: null, entry: { file, path, rel }, name: `${basename(file)}（歷史）`, title: `${rel} — 檔案歷史`, preview: false });
+  t.view = new HistoryView(t);
+  t.view.el.hidden = true;
+  activate(t.id);
+  await t.view.load();
+  return t;
+}
+
+class HistoryView {
+  constructor(tab) {
+    this.tab = tab;
+    this.commits = [];
+    this.idx = 0;
+    this.seq = 0;
+    this.mode = store.get('histMode', 'commit');
+    this.el = document.createElement('div');
+    this.el.className = 'view hist';
+    this.el.innerHTML = '<div class="hside"><div class="hinfo"></div><div class="hlist list" tabindex="0"></div></div><div class="hmain"></div>';
+    $('#stage').append(this.el);
+    this.list = $('.hlist', this.el);
+    this.pane = new DiffPane($('.hmain', this.el), {
+      head: (p) => this.headHtml(p),
+      onAction: (act) => this.action(act),
+      onOpenLine: (line) => { if (this.mode === 'working') openFile(this.tab.entry.file, { line }).catch(fail); },
+      sameText: () => (this.mode === 'working' ? '和目前的檔案內容相同。' : '這次提交沒有改變內容（可能只有重新命名或權限變更）。'),
+    });
+    this.list.addEventListener('click', (e) => { const r = e.target.closest('.hrow'); if (r) this.select(Number(r.dataset.i)).catch(fail); });
+    this.list.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      e.preventDefault();
+      this.select(Math.max(0, Math.min(this.commits.length - 1, this.idx + (e.key === 'ArrowDown' ? 1 : -1)))).catch(fail);
+    });
+  }
+
+  async load() {
+    const e = this.tab.entry;
+    const info = $('.hinfo', this.el);
+    info.textContent = '讀取提交紀錄…';
+    try {
+      const r = await td.invoke('gitLog', { id: st.pid, top: st.git.top, path: e.path });
+      this.commits = r.commits;
+      info.innerHTML = `<b title="${esc(e.rel)}">${esc(basename(e.path))}</b><span>${r.commits.length ? `${r.commits.length}${r.limited ? '+' : ''} 個提交` : ''}</span>`;
+      this.renderList();
+      if (!this.commits.length) { this.pane.error('這個檔案還沒有提交紀錄。'); return; }
+      await this.select(Math.min(this.idx, this.commits.length - 1));
+    } catch (err) {
+      info.textContent = '';
+      this.list.innerHTML = '';
+      this.pane.error(`無法讀取檔案歷史：${err.message}`);
+    }
+  }
+
+  renderList() {
+    this.list.innerHTML = this.commits.map((c, i) => {
+      const tip = `${c.short} ${c.subject}\n${c.author}　${fmtTime(c.at)}${c.orig ? `\n由 ${c.orig} 重新命名` : ''}`;
+      const badge = c.status && c.status !== 'M' ? `<span class="gs g-${esc(c.status)}">${esc(c.status)}</span>` : '';
+      return `<div class="hrow${i === this.idx ? ' sel' : ''}" data-i="${i}" title="${esc(tip)}">`
+        + `<div class="s1">${esc(c.subject || '（沒有說明）')}</div>`
+        + `<div class="s2"><span class="h">${esc(c.short)}</span><span class="a">${esc(c.author)}</span><span>${esc(fmtTime(c.at))}</span>${badge}</div></div>`;
+    }).join('');
+  }
+
+  async select(i) {
+    if (!this.commits[i]) return;
+    this.idx = i;
+    for (const r of $$('.hrow', this.list)) r.classList.toggle('sel', Number(r.dataset.i) === i);
+    const row = $(`.hrow[data-i="${i}"]`, this.list);
+    if (row) row.scrollIntoView({ block: 'nearest' });
+    await this.loadDiff();
+  }
+
+  async loadDiff() {
+    const c = this.commits[this.idx];
+    if (!c) return;
+    const seq = ++this.seq;
+    this.pane.loading();
+    try {
+      const d = await td.invoke('gitVersion', {
+        id: st.pid, top: st.git.top, rev: c.hash, path: c.path, orig: c.orig, status: c.status, mode: this.mode, target: this.tab.entry.path,
+      });
+      if (seq === this.seq) await this.pane.setData(d, c.path);
+    } catch (err) {
+      if (seq === this.seq) this.pane.error(`無法比對：${err.message}`);
+    }
+  }
+
+  headHtml(p) {
+    const c = this.commits[this.idx];
+    return `<span class="p" title="${esc(`${c.hash}\n${c.subject}`)}">${esc(c.short)}　${esc(c.subject)}</span>`
+      + `<div class="seg"><button data-act="mode-commit" class="${this.mode === 'commit' ? 'on' : ''}" title="上一版 ↔ 這個提交">這次提交的變更</button>`
+      + `<button data-act="mode-working" class="${this.mode === 'working' ? 'on' : ''}" title="這個提交 ↔ 目前的檔案">與目前檔案比較</button></div>`
+      + `${p.statsHtml()}<span class="sp"></span>${p.navHtml()}`
+      + `${c.status !== 'D' ? '<button class="secondary sm" data-act="restore" title="把目前的檔案改成這個提交的版本">↶ 還原成這個版本…</button>' : ''}`
+      + '<button class="ib sm" data-act="copy" title="複製提交編號">⧉</button><button class="ib sm" data-act="reload" title="重新整理">⟳</button>';
+  }
+
+  action(act) {
+    if (act === 'mode-commit' || act === 'mode-working') {
+      this.mode = act.slice(5);
+      store.set('histMode', this.mode);
+      return this.loadDiff();
+    }
+    if (act === 'restore') return restoreVersion(this);
+    if (act === 'copy') return copyText(this.commits[this.idx].hash);
+    if (act === 'reload') return this.load();
+    return null;
+  }
+
+  onFileChanged() { return this.mode === 'working' ? this.loadDiff() : null; }
+  saveViewState() { return null; }
+  destroy() { this.el.remove(); }
+}
+
+/** 把目前的檔案改成某個提交的版本 */
+async function restoreVersion(view) {
+  const c = view.commits[view.idx];
+  const e = view.tab.entry;
+  if (!c || !guardDirty([e.file])) return;
+  const ans = await td.dialog.message({
+    type: 'warning',
+    message: `要把「${basename(e.path)}」改成 ${c.short} 的版本嗎？`,
+    detail: `${c.subject}\n${c.author}　${fmtTime(c.at)}${c.path !== e.path ? `\n（當時的路徑：${c.path}）` : ''}\n\n目前檔案的內容會被取代。只會改寫工作目錄中的這個檔案，不會修改暫存區或提交；之後可以按「復原」改回來。`,
+    buttons: ['還原', '取消'], defaultId: 1, cancelId: 1,
+  });
+  if (ans.response !== 0) return;
+  const r = await td.invoke('gitRestoreVersion', { id: st.pid, top: st.git.top, rev: c.hash, path: c.path, target: e.path });
+  await afterDiskChange([e.file]);
+  resultBanner(`已把 ${basename(e.path)} 還原成 ${c.short} 的版本。`, r.undoId);
+}
+
 /* ───────────── 快捷鍵與事件 ───────────── */
 
 async function gotoLine() {
@@ -1378,6 +2194,8 @@ function onKeyDown(e) {
   if (e.ctrlKey && !e.metaKey && k === 'g') { e.preventDefault(); gotoLine(); return; }
   if (!mod) return;
   if (k === 's') { e.preventDefault(); save(activeTab(), e.shiftKey || e.altKey); }
+  else if (e.shiftKey && k === 'f') { e.preventDefault(); openSearch(false); }
+  else if (e.shiftKey && k === 'h') { e.preventDefault(); openSearch(true); }
   else if (k === 'f' && !e.altKey) { e.preventDefault(); openFind(false); }
   else if (k === 'h' || (k === 'f' && e.altKey)) { e.preventDefault(); openFind(true); }
   else if (k === 'p') { e.preventDefault(); setSide('files'); $('#filter').focus(); $('#filter').select(); }
@@ -1432,6 +2250,7 @@ async function runCommand(cmd) {
   if (cmd === 'addProject') await addProject();
   else if (cmd === 'openFile') await openFileDialog();
   else if (cmd === 'showChanges') { setSide('git'); await refreshGit(); }
+  else if (cmd === 'search') openSearch(false);
 }
 
 async function drainPending() {
@@ -1500,24 +2319,35 @@ function bind() {
   const changes = $('#changes');
   changes.addEventListener('click', (e) => {
     const h = e.target.closest('.grp-h');
+    if (h && e.target.closest('[data-rvall]')) { restoreEntries(st.git[h.dataset.grp]).catch(fail); return; }
     if (h) { const g = h.dataset.grp; if (st.gitCollapsed.has(g)) st.gitCollapsed.delete(g); else st.gitCollapsed.add(g); renderGit(); return; }
     const row = e.target.closest('.row[data-area]');
+    if (row && e.target.closest('[data-rv]')) { restoreEntries([gitEntry(row)]).catch(fail); return; }
     if (row) openDiff(gitEntry(row)).catch(fail);
   });
   changes.addEventListener('dblclick', (e) => {
     const row = e.target.closest('.row[data-area]');
-    if (!row) return;
+    if (!row || e.target.closest('[data-rv]')) return;
     const en = gitEntry(row);
     if (en.status === 'D') openDiff(en, { preview: false }).catch(fail);
     else openFile(en.file).catch(fail);
   });
   changes.addEventListener('contextmenu', (e) => {
+    const gh = e.target.closest('.grp-h');
+    if (gh && (gh.dataset.grp === 'unstaged' || gh.dataset.grp === 'untracked')) {
+      const list = st.git[gh.dataset.grp];
+      contextMenu(e, [[gh.dataset.grp === 'untracked' ? `刪除全部未追蹤的檔案（${list.length}）…` : `捨棄全部變更（${list.length}）…`, () => restoreEntries(list)]]);
+      return;
+    }
     const row = e.target.closest('.row[data-area]');
     if (!row) return;
     const en = gitEntry(row);
     const items = [['查看差異', () => openDiff(en, { preview: false })]];
     if (en.status !== 'D') items.push(['開啟檔案', () => openFile(en.file)]);
     if (!en.rel.startsWith('..') && en.status !== 'D') items.push(['在檔案樹中顯示', () => revealInTree(en.rel)]);
+    if (en.area !== 'untracked' && en.status !== 'A') items.push(['檔案歷史', () => openHistory(en.file)]);
+    if (en.area === 'unstaged') items.push('-', ['捨棄變更（改回暫存區的版本）…', () => restoreEntries([en])]);
+    else if (en.area === 'untracked') items.push('-', ['刪除未追蹤的檔案…', () => restoreEntries([en])]);
     items.push('-', ['複製路徑', () => copyText(en.file)], ['複製相對路徑', () => copyText(en.rel)]);
     if (en.status !== 'D') items.push([IS_MAC ? '在 Finder 中顯示' : '在檔案總管中顯示', () => td.invoke('reveal', en.file)]);
     contextMenu(e, items);
@@ -1550,6 +2380,9 @@ function bind() {
       items.push('-', ['複製路徑', () => copyText(t.file)]);
       if (rel !== null) items.push(['在檔案樹中顯示', () => revealInTree(rel)]);
       if (rel !== null && st.gitMap.has(rel)) items.push(['查看 Git 差異', () => openDiffForRel(rel)]);
+      if (st.git && st.git.repo && repoRel(t.file) !== null && !isUntracked(rel)) items.push(['檔案歷史', () => openHistory(t.file)]);
+      const rv = restorableEntry(rel);
+      if (rv) items.push([rv.area === 'untracked' ? '刪除未追蹤的檔案…' : '還原 Git 變更…', () => restoreEntries([rv])]);
     }
     if (t.kind === 'file' && !t.unavailable) items.push('-', ['另存新檔…', () => save(t, true)]);
     contextMenu(e, items);
@@ -1607,6 +2440,8 @@ async function init() {
   st.diffMode = store.get('diffMode', 'sbs');
   initSplitter();
   bind();
+  bindSearch();
+  loadSearchPrefs();
   st.info = await td.invoke('info');
   st.projects = st.info.projects;
   applySettings();

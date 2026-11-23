@@ -1,7 +1,7 @@
 {
   "name": "code-editor",
   "version": "1.0.0",
-  "description": "程式碼編輯器：專案檔案樹、語法高亮、Git 異動清單與差異比對",
+  "description": "程式碼編輯器：專案檔案樹、語法高亮、跨檔案搜尋取代、Git 異動清單、差異比對、還原與檔案歷史",
   "main": "backend/index.js",
   "private": true,
   "scripts": {
@@ -15,7 +15,7 @@
   "tooldock": {
     "id": "code-editor",
     "displayName": "程式碼編輯器",
-    "description": "像記事本一樣輕巧的程式碼編輯器：建立專案、瀏覽資料夾、語法高亮、多分頁編輯、尋找取代；Git 異動清單與並排／行內差異比對",
+    "description": "像記事本一樣輕巧的程式碼編輯器：建立專案、瀏覽資料夾、語法高亮、多分頁編輯、尋找取代、跨檔案搜尋與取代；Git 異動清單、並排／行內差異比對、還原變更與檔案歷史",
     "icon": "💻",
     "engine": "^1.4.0",
     "activationEvents": [],
@@ -44,6 +44,10 @@
         {
           "id": "codeEditor.showChanges",
           "title": "程式碼編輯器：Git 異動清單"
+        },
+        {
+          "id": "codeEditor.search",
+          "title": "程式碼編輯器：在專案中搜尋…"
         }
       ],
       "configuration": {

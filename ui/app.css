@@ -254,3 +254,70 @@ button.sm { min-height: 24px; padding: 0 8px; font-size: 12px; }
 #modalInput { height: 30px; font-size: 13px; }
 #modalHint { min-height: 16px; color: var(--err); font-size: 12px; }
 #modalBox .acts { display: flex; justify-content: flex-end; gap: 6px; }
+
+/* 列上滑過才出現的按鈕 */
+.ib.xs { min-width: 20px; min-height: 20px; padding: 0 4px; font-size: 11px; color: var(--fg-muted); }
+.ib.xs:hover { color: var(--fg-strong); }
+.row .acts, .grp-h .acts { display: none; gap: 1px; margin-left: auto; flex: none; }
+.row:hover .acts, .row.sel .acts, .grp-h:hover .acts { display: flex; }
+.row:hover .acts + .gs, .row.sel .acts + .gs { margin-left: 2px; }
+
+/* 跨檔案搜尋 */
+#sForm { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px 4px 4px; }
+.srow { display: flex; align-items: center; gap: 2px; }
+.srow .tw-btn { min-width: 18px; padding: 0; font-size: 10px; color: var(--fg-muted); }
+.srow .tw-pad { width: 18px; flex: none; }
+.sbox { flex: 1; min-width: 0; display: flex; align-items: center; gap: 1px; padding-right: 2px; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius); }
+.sbox:focus-within { outline: 1px solid var(--focus); outline-offset: -1px; }
+.sbox input { flex: 1; min-width: 0; height: 26px; border: 0; background: transparent; font-size: 12px; font-family: var(--mono); }
+.sbox input:focus { outline: none; }
+.sbox .ib.sm { min-width: 22px; min-height: 20px; font-size: 11px; color: var(--fg-muted); }
+.sbox .ib.tog.on { color: var(--fg-strong); }
+#sQuery.bad { color: var(--err); }
+.linkish { min-height: 18px; padding: 0 2px; background: transparent; border: 0; color: var(--fg-muted); font-size: 11px; }
+.linkish:hover { background: transparent; color: var(--fg-strong); }
+#sMore { display: flex; flex-direction: column; gap: 4px; padding-left: 20px; }
+#sMore[hidden] { display: none; }
+#sMore input { height: 26px; font-size: 12px; }
+#sBar { padding: 0 8px 4px 12px; font-size: 12px; color: var(--fg-muted); }
+#sBar:empty { display: none; }
+#sBar .sline { display: flex; align-items: center; gap: 4px; min-height: 24px; }
+#sBar .smsg { flex: 1; min-width: 0; line-height: 1.5; overflow: hidden; text-overflow: ellipsis; }
+#sBar .sline + .sline { margin-top: 2px; }
+#sResults { border-top: 1px solid var(--border); }
+#sResults .row { gap: 4px; }
+#sResults .sck { flex: none; width: 13px; height: 13px; margin: 0; }
+#sResults .sfile { padding-left: 4px; }
+#sResults .sfile .cnt { margin-left: auto; padding: 0 6px; border-radius: 9px; background: var(--bg-active); color: var(--fg-muted); font-size: 11px; flex: none; }
+#sResults .sfile:hover .cnt, #sResults .sfile.sel .cnt { margin-left: 4px; }
+#sResults .sfile .lock, #sResults .sfile .dmark { flex: none; font-size: 10px; color: var(--fg-muted); }
+#sResults .smatch { padding-left: 22px; font-family: var(--mono); font-size: 12px; }
+#sResults .smatch .pv { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; tab-size: 2; color: var(--fg); }
+#sResults .smatch .ln { flex: none; color: var(--fg-faint); font-size: 11px; }
+#sResults .smatch.off .pv { opacity: .5; }
+#sResults .smatch:hover .ln, #sResults .smatch.sel .ln { display: none; }
+#sResults mark { background: var(--hit-line); color: var(--fg-strong); border-radius: 2px; outline: 1px solid rgba(234, 179, 8, .5); }
+#sResults del { background: var(--del-strong); color: var(--fg-strong); text-decoration: line-through; }
+#sResults ins { background: var(--add-strong); color: var(--fg-strong); text-decoration: none; }
+
+/* 比對：每段變更的「還原此段」 */
+.dr { position: relative; }
+.hrev { position: absolute; top: 0; right: 6px; z-index: 2; min-height: 18px; padding: 0 8px; font-family: var(--font); font-size: 11px; background: var(--bg-elevated); color: var(--fg-strong); border: 1px solid var(--border-strong); border-radius: 4px; opacity: 0; }
+.dr:hover .hrev, .dr.focus .hrev, .hrev:focus-visible { opacity: 1; }
+.hrev:hover { background: var(--bg-hover); }
+
+/* 檔案歷史 */
+.hist { display: grid; grid-template-columns: minmax(200px, 280px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+.hist .hside { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); background: var(--bg-elevated); }
+.hist .hinfo { display: flex; align-items: baseline; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--fg-muted); }
+.hist .hinfo b { color: var(--fg-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist .hlist { padding-bottom: 12px; }
+.hist .hrow { padding: 6px 10px; border-bottom: 1px solid var(--border); cursor: default; user-select: none; }
+.hist .hrow:hover { background: var(--bg-hover); }
+.hist .hrow.sel { background: var(--bg-active); box-shadow: inset 2px 0 0 var(--accent); }
+.hist .hrow .s1 { color: var(--fg-strong); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist .hrow .s2 { display: flex; gap: 8px; margin-top: 2px; color: var(--fg-faint); font-size: 11px; white-space: nowrap; overflow: hidden; }
+.hist .hrow .s2 .h { font-family: var(--mono); color: var(--fg-muted); }
+.hist .hrow .s2 .a { overflow: hidden; text-overflow: ellipsis; }
+.hist .hrow .gs { margin-left: auto; font-family: var(--mono); font-weight: 600; }
+.hist .hmain { min-width: 0; min-height: 0; }

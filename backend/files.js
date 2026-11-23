@@ -82,16 +82,11 @@ function listFiles(root, exclude, limit = MAX_LIST) {
 const isBinary = (buf) => buf.subarray(0, 8000).includes(0);
 
 /**
- * 讀檔：統一成 LF 給畫面，記住換行字元與 BOM。
+ * Buffer → 文字（換行統一成 LF），記住換行字元與 BOM。
  * 不是合法 UTF-8 時改用 Big5 解碼並設為唯讀（Node 沒有 Big5 編碼器，存回去會變亂碼）。
+ * 二進位檔回傳 { binary: true }。
  */
-function readText(file) {
-  if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Error('檔案路徑不正確');
-  const st = fs.statSync(file);
-  if (st.isDirectory()) throw new Error('這是資料夾');
-  const base = { file, name: path.basename(file), size: st.size, mtime: st.mtimeMs };
-  if (st.size > MAX_OPEN) return { ...base, tooLarge: true };
-  const buf = fs.readFileSync(file);
+function decodeText(buf) {
   let encoding = 'utf8';
   let bom = false;
   let text;
@@ -102,7 +97,7 @@ function readText(file) {
     encoding = buf[0] === 0xff ? 'utf-16le' : 'utf-16be';
     text = new TextDecoder(encoding).decode(buf.subarray(2));
   } else if (isBinary(buf)) {
-    return { ...base, binary: true };
+    return { binary: true };
   } else {
     try {
       text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
@@ -114,7 +109,6 @@ function readText(file) {
   const crlf = (text.match(/\r\n/g) || []).length;
   const lf = (text.match(/(^|[^\r])\n/g) || []).length;
   return {
-    ...base,
     text: text.replace(/\r\n?/g, '\n'),
     eol: crlf > lf ? '\r\n' : '\n',
     bom,
@@ -123,15 +117,42 @@ function readText(file) {
   };
 }
 
+/** 讀檔：見 decodeText；超過 50 MB 時只回傳 tooLarge */
+function readText(file) {
+  if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Error('檔案路徑不正確');
+  const st = fs.statSync(file);
+  if (st.isDirectory()) throw new Error('這是資料夾');
+  const base = { file, name: path.basename(file), size: st.size, mtime: st.mtimeMs };
+  if (st.size > MAX_OPEN) return { ...base, tooLarge: true };
+  return { ...base, ...decodeText(fs.readFileSync(file)) };
+}
+
+/** LF 文字 → 要寫入的 Buffer（換回原本的換行字元，需要時加上 BOM） */
+function encodeText(text, eol = '\n', bom = false) {
+  const body = String(text).replace(/\r\n?/g, '\n').replace(/\n/g, eol === '\r\n' ? '\r\n' : '\n');
+  return Buffer.from((bom ? '\ufeff' : '') + body, 'utf8');
+}
+
+/** 先寫暫存檔再改名，避免寫到一半；保留原本的權限（新檔案可指定 mode） */
+function writeAtomic(file, data, mode) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  let m = mode;
+  try { m = fs.statSync(file).mode; } catch { /* 新檔案 */ }
+  try {
+    fs.writeFileSync(tmp, data, m ? { mode: m } : undefined);
+    if (m) fs.chmodSync(tmp, m & 0o7777);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 忽略 */ }
+    throw err;
+  }
+  return fs.statSync(file);
+}
+
 function writeText({ file, text, eol = '\n', bom = false }) {
   if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Error('存檔路徑不正確');
-  const body = String(text).replace(/\r\n?/g, '\n').replace(/\n/g, eol === '\r\n' ? '\r\n' : '\n');
-  const tmp = `${file}.${process.pid}.tmp`;
-  let mode;
-  try { mode = fs.statSync(file).mode; } catch { /* 新檔案 */ }
-  fs.writeFileSync(tmp, (bom ? '﻿' : '') + body, mode ? { encoding: 'utf8', mode } : 'utf8');
-  fs.renameSync(tmp, file);
-  return { file, name: path.basename(file), mtime: fs.statSync(file).mtimeMs };
+  const st = writeAtomic(file, encodeText(text, eol, bom));
+  return { file, name: path.basename(file), mtime: st.mtimeMs };
 }
 
 const BAD_NAME = /[\\/:*?"<>|\0]/;
@@ -161,4 +182,6 @@ function rename(root, rel, name) {
   return { from, file: to, rel: toRel(path.relative(root, to)) };
 }
 
-module.exports = { excluder, inside, resolveIn, listDir, listFiles, readText, writeText, create, rename, isBinary, toRel, MAX_OPEN };
+module.exports = {
+  excluder, inside, resolveIn, listDir, listFiles, decodeText, readText, encodeText, writeAtomic, writeText, create, rename, isBinary, toRel, MAX_OPEN,
+};
