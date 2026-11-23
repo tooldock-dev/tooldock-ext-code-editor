@@ -1,6 +1,6 @@
 {
   "name": "code-editor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "程式碼編輯器：專案檔案樹、語法高亮、跳到定義、反編譯、跨檔案搜尋取代、Git 異動清單、差異比對、還原與檔案歷史",
   "main": "backend/index.js",
   "private": true,
