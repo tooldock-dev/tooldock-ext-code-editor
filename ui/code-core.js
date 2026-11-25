@@ -909,6 +909,422 @@
     return a.length === b.length && a.every((k, i) => k === b[i]);
   }
 
+  /* ───────────── 多游標與列選取 ─────────────
+   * 選取以 { a, h, p?, col? } 表示：a 是錨點、h 是游標所在（head），p 為 true 的是主要游標（textarea 原生的選取），
+   * col 是上下移動時要回到的欄位。所有函式都不改動傳入的陣列，回傳新的選取。
+   */
+
+  const selFrom = (s) => Math.min(s.a, s.h);
+  const selTo = (s) => Math.max(s.a, s.h);
+
+  /** 依位置排序，合併重疊的選取（以及落在同一點的游標）；剛好保留一個主要游標 */
+  function normalizeSels(sels) {
+    const list = sels.map((s) => ({ ...s })).sort((x, y) => selFrom(x) - selFrom(y) || selTo(x) - selTo(y));
+    const out = [];
+    for (const s of list) {
+      const prev = out[out.length - 1];
+      const overlap = prev && (selFrom(s) < selTo(prev) || (selFrom(s) === selTo(prev) && (s.a === s.h || prev.a === prev.h)));
+      if (!overlap) { out.push(s); continue; }
+      const from = selFrom(prev);
+      const to = Math.max(selTo(prev), selTo(s));
+      const back = prev.h < prev.a; // 保留原本的方向
+      out[out.length - 1] = { a: back ? to : from, h: back ? from : to, ...(prev.p || s.p ? { p: true } : {}) };
+    }
+    let seen = false;
+    for (const s of out) { if (s.p && seen) delete s.p; else if (s.p) seen = true; }
+    if (out.length && !seen) out[out.length - 1].p = true;
+    return out;
+  }
+
+  const primaryOf = (sels) => sels.find((s) => s.p) || sels[sels.length - 1];
+
+  /**
+   * 對每個選取套用一段編輯：fn(text, from, to, i, sel) 回傳 { from, to, insert, a?, h? }（a、h 是新游標相對於 from 的位移，
+   * 省略時游標放在插入文字的後面）或 null（不改這個選取）。編輯範圍和前一個重疊時略過（例如同一行的兩個游標都要取消縮排）。
+   * 回傳 { from, to, insert, sels, text }：把原文的 [from, to) 換成 insert 就是結果 text（只要一次 insertText，⌘Z 一次復原）。
+   */
+  function editSels(text, sels, fn) {
+    const list = normalizeSels(sels);
+    const parts = [];
+    const out = [];
+    let last = 0;
+    let delta = 0;
+    let lo = Infinity;
+    let hi = -1;
+    list.forEach((s, i) => {
+      const r = fn(text, selFrom(s), selTo(s), i, s);
+      if (!r || r.from < last) { out.push({ a: s.a + delta, h: s.h + delta, ...(s.p ? { p: true } : {}) }); return; }
+      parts.push(text.slice(last, r.from), r.insert);
+      const base = r.from + delta;
+      const ca = r.a !== undefined ? r.a : r.insert.length;
+      const ch = r.h !== undefined ? r.h : ca;
+      out.push({ a: base + ca, h: base + ch, ...(s.p ? { p: true } : {}) });
+      delta += r.insert.length - (r.to - r.from);
+      last = r.to;
+      lo = Math.min(lo, r.from);
+      hi = Math.max(hi, r.to);
+    });
+    if (hi < 0) return null;
+    parts.push(text.slice(last));
+    const next = parts.join('');
+    return { from: lo, to: hi, insert: next.slice(lo, hi + delta), sels: normalizeSels(out), text: next };
+  }
+
+  /** 每個選取換成 insert；insert 是陣列時第 i 個選取用第 i 個字串（貼上與選取數量相同的多行文字） */
+  function insertAtSels(text, sels, insert) {
+    return editSels(text, sels, (t, from, to, i) => ({ from, to, insert: Array.isArray(insert) ? (insert[i] === undefined ? '' : insert[i]) : insert }));
+  }
+
+  /** 往前（Backspace）或往後（Delete）刪除；word 為 true 時刪到字的邊界 */
+  function deleteAtSels(text, sels, forward, word) {
+    return editSels(text, sels, (t, from, to) => {
+      if (from < to) return { from, to, insert: '' };
+      if (forward) {
+        if (from >= t.length) return null;
+        const end = word ? wordBoundary(t, from, 1) : from + charLen(t, from, 1);
+        return { from, to: end, insert: '' };
+      }
+      if (from <= 0) return null;
+      const start = word ? wordBoundary(t, from, -1) : from - charLen(t, from, -1);
+      return { from: start, to: from, insert: '' };
+    });
+  }
+
+  /** Enter：每個游標都延續所在行的縮排 */
+  function newlineAtSels(text, sels, unit) {
+    return editSels(text, sels, (t, from, to) => {
+      const e = newline(t, from, to, unit);
+      return { from: e.from, to: e.to, insert: e.insert, a: e.selStart - e.from };
+    });
+  }
+
+  /** Tab／Shift+Tab：同一行有好幾個游標時只縮排一次 */
+  function indentSels(text, sels, unit, outdent) {
+    return editSels(text, sels, (t, from, to) => {
+      const e = indent(t, from, to, unit, outdent);
+      if (!e) return null;
+      return { from: e.from, to: e.to, insert: e.insert, a: e.selStart - e.from, h: e.selEnd - e.from };
+    });
+  }
+
+  /** 從 pos 往 dir（±1）跨過一個字元的長度（surrogate pair 算一個字） */
+  function charLen(text, pos, dir) {
+    if (dir < 0) return pos >= 2 && /[\uDC00-\uDFFF]/.test(text[pos - 1]) && /[\uD800-\uDBFF]/.test(text[pos - 2]) ? 2 : 1;
+    return /[\uD800-\uDBFF]/.test(text[pos] || '') && /[\uDC00-\uDFFF]/.test(text[pos + 1] || '') ? 2 : 1;
+  }
+
+  const WORD_CH = /[\p{L}\p{N}_$]/u;
+  /** ⌥←／⌥→（Windows 是 Ctrl）：先跳過空白，再跳過同一類的字元；在行首／行尾時跨過換行 */
+  function wordBoundary(text, pos, dir) {
+    let p = pos;
+    const at = (i) => text[dir < 0 ? i - 1 : i];
+    const inRange = (i) => (dir < 0 ? i > 0 : i < text.length);
+    while (inRange(p) && /[ \t]/.test(at(p))) p += dir;
+    if (inRange(p) && at(p) === '\n') return p === pos ? p + dir : p;
+    if (!inRange(p)) return p;
+    const word = WORD_CH.test(at(p));
+    while (inRange(p) && at(p) !== '\n' && !/[ \t]/.test(at(p)) && WORD_CH.test(at(p)) === word) p += dir;
+    return p;
+  }
+
+  const lineStartAt = (text, pos) => text.lastIndexOf('\n', pos - 1) + 1;
+  const lineEndAt = (text, pos) => { const n = text.indexOf('\n', pos); return n < 0 ? text.length : n; };
+
+  /** 顯示欄位：Tab 跳到下一個定位點，全形字算兩欄 */
+  const WIDE = /^(?:[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]|[\uD840-\uD87F][\uDC00-\uDFFF])/;
+  function visualCol(line, off, tabSize = 4) {
+    let col = 0;
+    for (let i = 0; i < off && i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '\t') col += tabSize - (col % tabSize);
+      else if (/[\uDC00-\uDFFF]/.test(ch) && i > 0 && /[\uD800-\uDBFF]/.test(line[i - 1])) continue;
+      else col += WIDE.test(ch + (line[i + 1] || '')) ? 2 : 1;
+    }
+    return col;
+  }
+
+  /** 顯示欄位 col 對應的字元位置（取最近的字元邊界）；past 表示 col 超出行尾 */
+  function offsetAtCol(line, col, tabSize = 4) {
+    let c = 0;
+    for (let i = 0; i < line.length; i++) {
+      const next = visualCol(line, i + 1, tabSize);
+      const w = next - c;
+      if (w === 0) continue;
+      if (c + w / 2 > col) return { off: i, past: false };
+      c = next;
+    }
+    return { off: line.length, past: col > c };
+  }
+
+  /** 預設的欄位度量（顯示欄位）；畫面改用像素，讓全形字、比例字型也對齊 */
+  const colMetrics = (tabSize = 4) => ({ colOf: (line, off) => visualCol(line, off, tabSize), offAt: (line, col) => offsetAtCol(line, col, tabSize) });
+
+  /** 第 n 行（從 0 起算）的 [開頭, 結尾) */
+  function lineBounds(text, n) {
+    const s = lineStart(text, n + 1);
+    return [s, lineEndAt(text, s)];
+  }
+
+  /** pos 在第幾行（從 0 起算） */
+  const lineIndexAt = (text, pos) => { let n = 0; for (let i = text.indexOf('\n'); i >= 0 && i < pos; i = text.indexOf('\n', i + 1)) n++; return n; };
+
+  /**
+   * 列選取（矩形）：從 (aLine, aCol) 到 (hLine, hCol)，每一行一個選取。col 的單位由 metrics 決定。
+   * 有寬度的矩形略過太短的行（行尾在矩形左邊）；寬度為 0 時每一行都放游標（行太短就放在行尾），方便在每行同一欄插入文字。
+   * 主要游標在 hLine。
+   */
+  function columnSels(text, aLine, aCol, hLine, hCol, metrics = colMetrics()) {
+    const total = (text.match(/\n/g) || []).length + 1;
+    const clampLine = (n) => Math.max(0, Math.min(total - 1, n));
+    aLine = clampLine(aLine);
+    hLine = clampLine(hLine);
+    const minCol = Math.min(aCol, hCol);
+    const sels = [];
+    const step = hLine >= aLine ? 1 : -1;
+    for (let n = aLine; ; n += step) {
+      const [s, e] = lineBounds(text, n);
+      const line = text.slice(s, e);
+      const short = aCol !== hCol && metrics.colOf(line, line.length) <= minCol;
+      if (!short || n === hLine) {
+        sels.push({ a: s + metrics.offAt(line, aCol).off, h: s + metrics.offAt(line, hCol).off, ...(n === hLine ? { p: true } : {}) });
+      }
+      if (n === hLine) break;
+    }
+    return normalizeSels(sels);
+  }
+
+  /**
+   * 移動所有游標：key 是 Left／Right／Up／Down／Home／End，extend 為 true 時延伸選取，word 為 true 時以字為單位。
+   * 上下移動保留目標欄位（sel.col，單位由 metrics 決定）。
+   */
+  function moveSels(text, sels, key, { extend = false, word = false, metrics = colMetrics() } = {}) {
+    const out = sels.map((s) => {
+      const empty = s.a === s.h;
+      let h = s.h;
+      let col;
+      if (!extend && !empty && !word && (key === 'Left' || key === 'Right')) {
+        h = key === 'Left' ? selFrom(s) : selTo(s);
+      } else if (key === 'Left') h = word ? wordBoundary(text, s.h, -1) : Math.max(0, s.h - charLen(text, s.h, -1));
+      else if (key === 'Right') h = word ? wordBoundary(text, s.h, 1) : Math.min(text.length, s.h + charLen(text, s.h, 1));
+      else if (key === 'Home') {
+        const ls = lineStartAt(text, s.h);
+        const first = ls + (text.slice(ls, lineEndAt(text, s.h)).match(/^[ \t]*/) || [''])[0].length;
+        h = s.h === first ? ls : first;
+      } else if (key === 'End') h = lineEndAt(text, s.h);
+      else if (key === 'Up' || key === 'Down') {
+        const ls = lineStartAt(text, s.h);
+        const goal = s.col !== undefined ? s.col : metrics.colOf(text.slice(ls, s.h), s.h - ls);
+        col = goal;
+        if (key === 'Up') {
+          if (ls === 0) h = 0;
+          else { const ps = lineStartAt(text, ls - 1); h = ps + metrics.offAt(text.slice(ps, ls - 1), goal).off; }
+        } else {
+          const le = lineEndAt(text, s.h);
+          if (le >= text.length) h = text.length;
+          else { const ns = le + 1; h = ns + metrics.offAt(text.slice(ns, lineEndAt(text, ns)), goal).off; }
+        }
+      }
+      return { a: extend ? s.a : h, h, ...(s.p ? { p: true } : {}), ...(col !== undefined ? { col } : {}) };
+    });
+    // 合併時會丟掉 col：只有沒合併的選取保留
+    const merged = normalizeSels(out);
+    return merged.map((m) => { const o = out.find((x) => x.a === m.a && x.h === m.h && x.col !== undefined); return o ? { ...m, col: o.col } : m; });
+  }
+
+  /** ⌥⌘↑／⌥⌘↓：在最上面（或最下面）的游標的上一行（下一行）同一欄加一個游標，成為主要游標；已到頭時回傳 null */
+  function addCaretVertical(text, sels, dir, metrics = colMetrics()) {
+    const list = normalizeSels(sels);
+    const edge = dir < 0 ? list[0] : list[list.length - 1];
+    const src = sels.find((s) => s.a === edge.a && s.h === edge.h && s.col !== undefined);
+    const ls = lineStartAt(text, edge.h);
+    const col = src ? src.col : metrics.colOf(text.slice(ls, edge.h), edge.h - ls);
+    let pos;
+    if (dir < 0) {
+      if (ls === 0) return null;
+      const ps = lineStartAt(text, ls - 1);
+      pos = ps + metrics.offAt(text.slice(ps, ls - 1), col).off;
+    } else {
+      const le = lineEndAt(text, edge.h);
+      if (le >= text.length) return null;
+      const ns = le + 1;
+      pos = ns + metrics.offAt(text.slice(ns, lineEndAt(text, ns)), col).off;
+    }
+    const out = normalizeSels([...list.map(({ p: _p, ...s }) => s), { a: pos, h: pos, p: true }]);
+    return out.map((s) => (s.a === pos && s.h === pos ? { ...s, col } : s));
+  }
+
+  const isWordAt = (text, from, to) => !(from > 0 && WORD_CH.test(text[from - 1])) && !(to < text.length && WORD_CH.test(text[to]));
+
+  /**
+   * ⌘D：主要游標沒有選取時選取游標所在的字（之後只找整個字相符的）；已有選取時再選下一個相同的文字（到結尾會從頭找）。
+   * wordAt(text, pos) 回傳 { start, end } 或 null。回傳 { sels, word }，找不到更多時回傳 null。
+   */
+  function nextOccurrence(text, sels, { word = false, wordAt: wa } = {}) {
+    const list = normalizeSels(sels);
+    const p = primaryOf(list);
+    if (p.a === p.h) {
+      if (list.length > 1) return null;
+      const w = wa ? wa(text, p.h) : null;
+      if (!w) return null;
+      return { sels: [{ a: w.start, h: w.end, p: true }], word: true };
+    }
+    const needle = text.slice(selFrom(p), selTo(p));
+    const taken = (i) => list.some((s) => selFrom(s) < i + needle.length && selTo(s) > i);
+    const ok = (i) => !taken(i) && (!word || isWordAt(text, i, i + needle.length));
+    let found = -1;
+    for (let i = text.indexOf(needle, selTo(p)); i >= 0; i = text.indexOf(needle, i + 1)) if (ok(i)) { found = i; break; }
+    if (found < 0) for (let i = text.indexOf(needle); i >= 0 && i < selFrom(p); i = text.indexOf(needle, i + 1)) if (ok(i)) { found = i; break; }
+    if (found < 0) return null;
+    return { sels: normalizeSels([...list.map(({ p: _p, ...s }) => s), { a: found, h: found + needle.length, p: true }]), word };
+  }
+
+  /** ⇧⌘L：選取所有和主要選取相同的文字（或游標所在的字，整個字相符）；最多 limit 個 */
+  function allOccurrences(text, sels, { word = false, wordAt: wa, limit = 10000 } = {}) {
+    const list = normalizeSels(sels);
+    const p = primaryOf(list);
+    let from = selFrom(p);
+    let to = selTo(p);
+    if (from === to) {
+      const w = wa ? wa(text, p.h) : null;
+      if (!w) return null;
+      from = w.start; to = w.end; word = true;
+    }
+    const needle = text.slice(from, to);
+    const out = [];
+    for (let i = text.indexOf(needle); i >= 0 && out.length < limit; i = text.indexOf(needle, i + needle.length)) {
+      if (!word || isWordAt(text, i, i + needle.length)) out.push({ a: i, h: i + needle.length, ...(i === from ? { p: true } : {}) });
+    }
+    return out.length ? normalizeSels(out) : null;
+  }
+
+  /** 每個選取的文字（依位置排序） */
+  const selectedTexts = (text, sels) => normalizeSels(sels).map((s) => text.slice(selFrom(s), selTo(s)));
+
+  /** 插入數字序列：第 i 個游標（依位置排序）插入 start + i * step，pad 為補零後的最小位數 */
+  function sequenceAtSels(text, sels, { start = 1, step = 1, pad = 0 } = {}) {
+    const nums = normalizeSels(sels).map((_, i) => {
+      const n = start + i * step;
+      const s = String(Math.abs(n)).padStart(pad, '0');
+      return n < 0 ? `-${s}` : s;
+    });
+    return insertAtSels(text, sels, nums);
+  }
+
+  /* ───────────── 分享：CSV／JSON 轉成表格 ───────────── */
+
+  /** 猜分隔字元：第一行（引號外）出現最多的 , \t ; | */
+  function guessDelimiter(text) {
+    const nl = text.indexOf('\n');
+    const head = text.slice(0, nl < 0 ? text.length : nl).replace(/"[^"]*"/g, '');
+    let best = ',';
+    let max = 0;
+    for (const d of [',', '\t', ';', '|']) {
+      const n = head.split(d).length - 1;
+      if (n > max) { max = n; best = d; }
+    }
+    return best;
+  }
+
+  /** RFC 4180 CSV：支援引號、引號內換行、"" 跳脫、CRLF、BOM；略過結尾的空行 */
+  function parseCsv(text, delimiter) {
+    const src = String(text).replace(/^﻿/, '');
+    const d = delimiter || guessDelimiter(src);
+    const rows = [];
+    let row = [];
+    let cell = '';
+    let quoted = false;
+    let i = 0;
+    while (i < src.length) {
+      const ch = src[i];
+      if (quoted) {
+        if (ch === '"') {
+          if (src[i + 1] === '"') { cell += '"'; i += 2; continue; }
+          quoted = false; i++; continue;
+        }
+        cell += ch; i++; continue;
+      }
+      if (ch === '"' && cell === '') { quoted = true; i++; continue; }
+      if (ch === d) { row.push(cell); cell = ''; i++; continue; }
+      if (ch === '\r' || ch === '\n') {
+        row.push(cell); rows.push(row); row = []; cell = '';
+        i += ch === '\r' && src[i + 1] === '\n' ? 2 : 1;
+        continue;
+      }
+      cell += ch; i++;
+    }
+    if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+    while (rows.length && rows[rows.length - 1].every((c) => c === '')) rows.pop();
+    return { rows, delimiter: d };
+  }
+
+  /** 欄位名稱：空白時用「欄位 N」，重複時加上序號 */
+  function uniqueNames(names) {
+    const used = new Set();
+    return names.map((raw, i) => {
+      const base = String(raw == null ? '' : raw).trim() || `欄位 ${i + 1}`;
+      let n = base;
+      for (let k = 2; used.has(n); k++) n = `${base} (${k})`;
+      used.add(n);
+      return n;
+    });
+  }
+
+  /** CSV → tooldock.table 的 payload（第一列是標題；值一律是字串，不猜型別，避免 00123、金額失真） */
+  function csvToTable(text, delimiter) {
+    const { rows } = parseCsv(text, delimiter);
+    if (!rows.length) throw new Error('CSV 沒有內容');
+    const width = Math.max(...rows.map((r) => r.length));
+    const names = uniqueNames(Array.from({ length: width }, (_, i) => rows[0][i]));
+    return {
+      columns: names.map((name) => ({ name, type: 'string' })),
+      rows: rows.slice(1).map((r) => Array.from({ length: width }, (_, i) => (r[i] === undefined ? null : r[i]))),
+    };
+  }
+
+  const jsonCell = (v) => {
+    if (v === undefined || v === null) return null;
+    if (typeof v === 'string' || typeof v === 'boolean') return v;
+    if (typeof v === 'number') return Number.isInteger(v) && !Number.isSafeInteger(v) ? { type: 'bigint', value: String(v) } : v;
+    return { type: 'json', value: v };
+  };
+
+  /**
+   * JSON → tooldock.table 的 payload；不是表格的形狀時回傳 null。
+   * 接受：物件陣列（欄位是所有鍵的聯集，依出現順序）、第一列是標題的二維陣列、或只有一個陣列屬性的物件（例如 { data: [...] }）。
+   */
+  function jsonToTable(value) {
+    let v = value;
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const arrays = Object.values(v).filter(Array.isArray);
+      if (arrays.length !== 1) return null;
+      v = arrays[0];
+    }
+    if (!Array.isArray(v) || !v.length) return null;
+    if (v.every((r) => r && typeof r === 'object' && !Array.isArray(r))) {
+      const keys = [];
+      const seen = new Set();
+      for (const r of v) for (const k of Object.keys(r)) if (!seen.has(k)) { seen.add(k); keys.push(k); }
+      if (!keys.length) return null;
+      return { columns: uniqueNames(keys).map((name) => ({ name })), rows: v.map((r) => keys.map((k) => jsonCell(r[k]))) };
+    }
+    if (v.every(Array.isArray) && v[0].length && v[0].every((c) => typeof c === 'string' || typeof c === 'number')) {
+      const width = Math.max(...v.map((r) => r.length));
+      const names = uniqueNames(Array.from({ length: width }, (_, i) => v[0][i]));
+      return { columns: names.map((name) => ({ name })), rows: v.slice(1).map((r) => Array.from({ length: width }, (_, i) => jsonCell(r[i]))) };
+    }
+    return null;
+  }
+
+  /** 檔案可以怎麼分享：回傳 [{ kind: 'table' | 'text', mime? }]，第一個是建議的方式；不支援的副檔名回傳 [] */
+  function shareKinds(filename) {
+    const ext = (String(filename || '').split('.').pop() || '').toLowerCase();
+    if (ext === 'md' || ext === 'markdown') return [{ kind: 'text', mime: 'text/markdown' }];
+    if (ext === 'csv') return [{ kind: 'table' }, { kind: 'text', mime: 'text/csv' }];
+    if (ext === 'tsv') return [{ kind: 'table' }, { kind: 'text', mime: 'text/tab-separated-values' }];
+    if (ext === 'json') return [{ kind: 'table' }, { kind: 'text', mime: 'application/json' }];
+    return [];
+  }
+
   return {
     LANGS, LANG_NAME, langFor, lineComment, escapeHtml, splitHtmlLines, cursorInfo, lineStart, lineRange,
     indent, newline, toggleComment, toLines, diffLines, sideBySide, unified, fold, diffStats,
@@ -916,5 +1332,9 @@
     searchRegex, findInText, expandReplacement, applyReplacements, splitList, globRegex, pathFilter,
     symbolsIn, symbolFamily, symbolCaseInsensitive, wordAt, importHints, rankDefinitions, joinPath,
     comboFromEvent, normalizeCombo, comboLabel, comboProblem, reservedBy, resolveKeymap, sameKeys,
+    selFrom, selTo, normalizeSels, primaryOf, editSels, insertAtSels, deleteAtSels, newlineAtSels, indentSels,
+    wordBoundary, visualCol, offsetAtCol, colMetrics, lineBounds, lineIndexAt, columnSels, moveSels, addCaretVertical,
+    nextOccurrence, allOccurrences, selectedTexts, sequenceAtSels,
+    guessDelimiter, parseCsv, csvToTable, jsonToTable, shareKinds,
   };
 }));

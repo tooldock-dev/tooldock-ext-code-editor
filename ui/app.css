@@ -176,6 +176,15 @@ button.sm { min-height: 24px; padding: 0 8px; font-size: 12px; }
 .code.plain pre { display: none; }
 .code.plain textarea { position: relative; height: 100%; overflow: auto; color: var(--fg-strong); padding: 6px 12px; }
 .code.readonly textarea { caret-color: var(--fg-faint); }
+/* 多游標：其他選取畫在 <pre> 上、textarea 下；其他游標畫在最上層（主要游標由 textarea 自己畫） */
+.code .mc-sel, .code .mc-car { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.code .mc-sel i { position: absolute; background: var(--sel); border-radius: 2px; }
+.code .mc-car b { position: absolute; width: 2px; margin-left: -1px; background: var(--fg-strong); }
+.code .mc-car.blink b { animation: mc-blink 1.06s steps(1) infinite; }
+.code .mc-car.idle b { opacity: .45; animation: none; }
+.code.plain .mc-sel, .code.plain .mc-car { display: none; }
+@keyframes mc-blink { 50% { opacity: 0; } }
+body.col-mode .code textarea { cursor: crosshair; }
 .msg-view { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; color: var(--fg-muted); }
 
 /* 語法顏色 */

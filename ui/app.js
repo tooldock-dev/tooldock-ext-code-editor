@@ -190,13 +190,19 @@ class CodeView {
     this.tab = tab;
     this.el = document.createElement('div');
     this.el.className = 'view code';
-    this.el.innerHTML = '<div class="box"><pre aria-hidden="true"></pre><textarea spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea></div>';
+    this.el.innerHTML = '<div class="box"><pre aria-hidden="true"></pre><div class="mc-sel" aria-hidden="true"></div><textarea spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea><div class="mc-car" aria-hidden="true"></div></div>';
+    this.box = $('.box', this.el);
     this.pre = $('pre', this.el);
     this.ta = $('textarea', this.el);
+    this.selLayer = $('.mc-sel', this.el);
+    this.carLayer = $('.mc-car', this.el);
     this.curLine = -1;
     this.hitLine = -1;
     this.raf = 0;
     this.lineCount = 0;
+    this.sels = null; // 多游標：兩個以上的選取時才有值（見〈多游標與列選取〉）
+    this.colBox = null; // 列選取的矩形：{ aLine, aX, hLine, hX }
+    bindMulti(this);
     this.ta.addEventListener('input', () => this.onInput());
     this.ta.addEventListener('keydown', (e) => onEditorKey(e, this));
     this.ta.addEventListener('select', () => this.onCaret());
@@ -212,6 +218,7 @@ class CodeView {
   get text() { return this.ta.value; }
 
   setText(text) {
+    this.exitMulti();
     this.ta.value = text;
     this.large = text.length > LARGE_CHARS || (text.match(/\n/g) || []).length > LARGE_LINES;
     this.el.classList.toggle('plain', this.large);
@@ -239,6 +246,8 @@ class CodeView {
   }
 
   onInput() {
+    // 不是多游標自己送出的編輯（⌘Z、拖放…）：其他游標的位置已經不準，回到單一游標
+    if (this.sels && !this.selfEdit && !this.composing) this.exitMulti();
     if (this.tab.preview) pinTab(this.tab);
     cancelAnimationFrame(this.raf);
     this.raf = requestAnimationFrame(() => this.render());
@@ -255,9 +264,11 @@ class CodeView {
     this.lineCount = lines.length;
     this.el.style.setProperty('--gut', `calc(${String(lines.length).length}ch + 30px)`);
     this.pre.innerHTML = lines.map((l) => `<div class="l">${lineHtml(l)}</div>`).join('');
+    this.starts = null;
     this.curLine = -1;
     this.hitLine = -1;
     this.onCaret();
+    this.drawSels();
   }
 
   caretLine() {
@@ -315,6 +326,11 @@ class CodeView {
   updateStatus() {
     if (this.tab !== activeTab()) return;
     const { line, col } = C.cursorInfo(this.ta.value, this.ta.selectionStart);
+    if (this.sels) {
+      const n = this.sels.reduce((m, s) => m + Math.abs(s.h - s.a), 0);
+      $('#stPos').textContent = `${this.sels.length.toLocaleString()} 個游標${n ? `（已選取 ${n.toLocaleString()}）` : ''}，主要在第 ${line} 行，第 ${col} 欄`;
+      return;
+    }
     const sel = Math.abs(this.ta.selectionEnd - this.ta.selectionStart);
     $('#stPos').textContent = `第 ${line} 行，第 ${col} 欄${sel ? `（已選取 ${sel}）` : ''}`;
   }
@@ -325,6 +341,7 @@ class CodeView {
 
   restoreViewState(v) {
     if (!v) return;
+    this.exitMulti();
     this.ta.setSelectionRange(v.s || 0, v.e || 0);
     this.el.scrollTop = v.top || 0;
     this.el.scrollLeft = v.left || 0;
@@ -332,6 +349,7 @@ class CodeView {
 
   gotoLine(line, col = 1) {
     const pos = Math.min(this.ta.value.length, C.lineStart(this.ta.value, line) + col - 1);
+    this.exitMulti();
     this.focus();
     this.ta.setSelectionRange(pos, pos);
     this.onCaret();
@@ -339,11 +357,630 @@ class CodeView {
   }
 
   destroy() { cancelAnimationFrame(this.raf); this.el.remove(); }
+
+  /* ── 多游標 ── */
+
+  /** 原生選取（主要游標）的 { a, h } */
+  nativeSel() {
+    const ta = this.ta;
+    return ta.selectionDirection === 'backward' ? { a: ta.selectionEnd, h: ta.selectionStart } : { a: ta.selectionStart, h: ta.selectionEnd };
+  }
+
+  /** 目前所有選取（沒有多游標時只有原生選取） */
+  allSels() { return this.sels || [{ ...this.nativeSel(), p: true }]; }
+
+  /** 原生選取仍是主要游標：其他功能（尋找、跳到定義…）移動了原生選取時，多游標就不再適用 */
+  inSync() {
+    if (!this.sels) return true;
+    const p = C.primaryOf(this.sels);
+    const n = this.nativeSel();
+    return C.selFrom(p) === C.selFrom(n) && C.selTo(p) === C.selTo(n);
+  }
+
+  /** 設定所有選取；只剩一個時回到原生的單一游標。keepBox 為 true 時保留列選取的矩形（鍵盤延伸列選取用） */
+  setSels(sels, { reveal = true, keepBox = false } = {}) {
+    if (!keepBox) this.colBox = null;
+    this.wholeWord = false;
+    const list = C.normalizeSels(sels);
+    if (this.large && list.length > 1) { notice('大型檔案不支援多游標'); list.splice(0, list.length, C.primaryOf(list)); }
+    const p = C.primaryOf(list);
+    this.sels = list.length > 1 ? list : null;
+    this.ta.setSelectionRange(C.selFrom(p), C.selTo(p), p.h < p.a ? 'backward' : 'forward');
+    this.el.classList.toggle('multi', !!this.sels);
+    this.drawSels();
+    this.onCaret(reveal);
+  }
+
+  exitMulti() {
+    if (!this.sels && !this.colBox) return;
+    this.sels = null;
+    this.colBox = null;
+    this.el.classList.remove('multi');
+    this.selLayer.textContent = '';
+    this.carLayer.textContent = '';
+    if (this.tab === activeTab()) this.updateStatus();
+  }
+
+  /** 每行的開頭位置（快取到文字改變為止） */
+  lineStarts() {
+    const text = this.ta.value;
+    if (!this.starts || this.startsText !== text) {
+      const s = [0];
+      for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) s.push(i + 1);
+      this.starts = s;
+      this.startsText = text;
+    }
+    return this.starts;
+  }
+
+  lineOf(pos) {
+    const s = this.lineStarts();
+    let lo = 0;
+    let hi = s.length - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (s[m] <= pos) lo = m; else hi = m - 1; }
+    return lo;
+  }
+
+  /** 第 line 行裡第 off 個字元在 <pre> 中的文字節點位置 */
+  domPoint(line, off) {
+    const row = this.pre.children[line];
+    if (!row) return null;
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    let left = off;
+    let last = null;
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      last = n;
+      if (left <= n.length) return { node: n, off: left, row };
+      left -= n.length;
+    }
+    return last ? { node: last, off: last.length, row } : { node: null, off: 0, row };
+  }
+
+  /** 把其他游標畫在覆蓋層上（主要游標由 textarea 自己畫）；文字改變時在重新高亮之後呼叫 */
+  drawSels() {
+    if (!this.sels || this.large) { this.selLayer.textContent = ''; this.carLayer.textContent = ''; return; }
+    if (this.pre.children.length === 0 || this.renderedText !== this.ta.value) return; // 等 render() 完成後再畫
+    const base = this.box.getBoundingClientRect();
+    const gut = parseFloat(getComputedStyle(this.ta).paddingLeft) || 0;
+    const lh = parseFloat(getComputedStyle(this.pre).lineHeight) || this.pre.children[0].offsetHeight;
+    // 文字範圍的高度只有字型本身，畫的時候撐滿整行（和原生選取一樣高）
+    const fit = (r) => ({ top: r.top - base.top - (lh - r.height) / 2, h: lh });
+    const font = this.font();
+    const spaceW = textWidth(' ', font);
+    const text = this.ta.value;
+    const starts = this.lineStarts();
+    const selHtml = [];
+    const carHtml = [];
+    const range = document.createRange();
+    const caretAt = (pos) => {
+      const line = this.lineOf(pos);
+      const pt = this.domPoint(line, pos - starts[line]);
+      if (!pt) return null;
+      if (!pt.node) return { x: gut, y: pt.row.getBoundingClientRect().top - base.top, h: lh };
+      range.setStart(pt.node, pt.off);
+      range.setEnd(pt.node, pt.off);
+      const r = range.getClientRects()[0] || range.getBoundingClientRect();
+      if (!r.height) return { x: r.left - base.left, y: pt.row.getBoundingClientRect().top - base.top, h: lh };
+      const f = fit(r);
+      return { x: r.left - base.left, y: f.top, h: f.h };
+    };
+    const MAX = 3000; // 太多時只畫前面的，避免卡住
+    let drawn = 0;
+    for (const s of this.sels) {
+      if (drawn++ > MAX) break;
+      const from = C.selFrom(s);
+      const to = C.selTo(s);
+      if (from < to && !s.p) {
+        for (let line = this.lineOf(from); line <= this.lineOf(to) && line < starts.length; line++) {
+          const ls = starts[line];
+          const le = line + 1 < starts.length ? starts[line + 1] - 1 : text.length;
+          const a = Math.max(from, ls) - ls;
+          const b = Math.min(to, le) - ls;
+          const nl = to > le; // 選取跨過這一行的換行字元
+          const pa = this.domPoint(line, a);
+          const pb = this.domPoint(line, b);
+          if (!pa || !pa.node || !pb.node || a === b) {
+            const c = caretAt(ls + a);
+            if (c && (nl || a !== b)) selHtml.push(`<i style="left:${c.x}px;top:${c.y}px;width:${spaceW}px;height:${c.h}px"></i>`);
+            continue;
+          }
+          range.setStart(pa.node, pa.off);
+          range.setEnd(pb.node, pb.off);
+          const rects = [...range.getClientRects()].filter((r) => r.width > 0);
+          rects.forEach((r, k) => {
+            const w = r.width + (nl && k === rects.length - 1 ? spaceW : 0);
+            const f = fit(r);
+            selHtml.push(`<i style="left:${r.left - base.left}px;top:${f.top}px;width:${w}px;height:${f.h}px"></i>`);
+          });
+        }
+      }
+      if (!s.p) {
+        const c = caretAt(s.h);
+        if (c) carHtml.push(`<b style="left:${c.x}px;top:${c.y}px;height:${c.h}px"></b>`);
+      }
+    }
+    this.selLayer.innerHTML = selHtml.join('');
+    this.carLayer.innerHTML = carHtml.join('');
+    // 重新開始閃爍，打字時游標保持顯示
+    this.carLayer.classList.remove('blink');
+    void this.carLayer.offsetWidth;
+    this.carLayer.classList.add('blink');
+  }
+
+  font() {
+    const cs = getComputedStyle(this.ta);
+    return `${cs.fontSize} ${cs.fontFamily}`;
+  }
+
+  /** 以像素為單位的欄位度量（列選取、上下移動用），和畫面上的位置一致 */
+  metrics() {
+    const font = this.font();
+    if (this.metricsCache && this.metricsCache.font === font && this.metricsCache.tab === setting('tabSize', 4)) return this.metricsCache.m;
+    const widths = new Map();
+    const cw = (ch) => { let w = widths.get(ch); if (w === undefined) { w = textWidth(ch, font); widths.set(ch, w); } return w; };
+    const tabW = cw(' ') * (Number(setting('tabSize', 4)) || 4);
+    const advance = (x, line, i) => {
+      const ch = line[i];
+      if (ch === '\t') return { x: (Math.floor(x / tabW + 1e-6) + 1) * tabW, n: 1 };
+      const pair = /[\uD800-\uDBFF]/.test(ch) && /[\uDC00-\uDFFF]/.test(line[i + 1] || '');
+      return { x: x + cw(pair ? line.slice(i, i + 2) : ch), n: pair ? 2 : 1 };
+    };
+    const m = {
+      colOf(line, off) {
+        let x = 0;
+        for (let i = 0; i < off && i < line.length;) { const r = advance(x, line, i); x = r.x; i += r.n; }
+        return x;
+      },
+      offAt(line, col) {
+        let x = 0;
+        for (let i = 0; i < line.length;) {
+          const r = advance(x, line, i);
+          if ((x + r.x) / 2 > col) return { off: i, past: false };
+          x = r.x;
+          i += r.n;
+        }
+        return { off: line.length, past: col > x + 1 };
+      },
+    };
+    this.metricsCache = { font, tab: setting('tabSize', 4), m };
+    return m;
+  }
+
+  /** 滑鼠位置 → { line, x }（x 是相對於文字起點的像素）；自動換行時不支援，回傳 null */
+  pointAt(e) {
+    if (this.el.classList.contains('wrap') || this.large) return null;
+    const rows = this.pre.children;
+    if (!rows.length) return null;
+    const base = this.pre.getBoundingClientRect();
+    const y = e.clientY - base.top;
+    let lo = 0;
+    let hi = rows.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (rows[mid].offsetTop <= y) lo = mid; else hi = mid - 1; }
+    const gut = parseFloat(getComputedStyle(this.ta).paddingLeft) || 0;
+    return { line: lo, x: Math.max(0, e.clientX - this.box.getBoundingClientRect().left - gut) };
+  }
+
+  /** { line, x } → 文字位置 */
+  posAt(pt) {
+    const starts = this.lineStarts();
+    const ls = starts[pt.line];
+    const le = pt.line + 1 < starts.length ? starts[pt.line + 1] - 1 : this.ta.value.length;
+    return ls + this.metrics().offAt(this.ta.value.slice(ls, le), pt.x).off;
+  }
+}
+
+/* ───────────── 多游標與列選取 ───────────── */
+
+/** 一次套用所有游標的編輯（code-core 的 editSels 結果），整段只用一次 insertText，⌘Z 一次復原 */
+function applyMulti(view, r) {
+  if (!r) return false;
+  const ta = view.ta;
+  ta.focus({ preventScroll: true });
+  view.selfEdit = true;
+  try {
+    ta.setSelectionRange(r.from, r.to);
+    let ok;
+    if (r.insert === '') ok = r.from === r.to || document.execCommand('delete');
+    else ok = document.execCommand('insertText', false, r.insert);
+    if (!ok) {
+      ta.setRangeText(r.insert, r.from, r.to, 'end');
+      ta.dispatchEvent(new Event('input'));
+    }
+  } finally {
+    view.selfEdit = false;
+  }
+  view.setSels(r.sels);
+  return true;
+}
+
+const ARROW = { ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up', ArrowDown: 'Down', Home: 'Home', End: 'End' };
+
+/** 多游標時的按鍵；有處理時回傳 true */
+function multiKey(e, view) {
+  const ta = view.ta;
+  const modKey = IS_MAC ? e.metaKey : e.ctrlKey;
+  const wordKey = IS_MAC ? e.altKey && !e.metaKey && !e.ctrlKey : e.ctrlKey && !e.altKey;
+  const text = ta.value;
+  const done = () => { e.preventDefault(); return true; };
+  if (e.key === 'Escape' && !e.shiftKey && !e.altKey && !modKey) {
+    e.stopPropagation(); // 先取消多游標，再按一次才關閉尋找列
+    view.setSels([C.primaryOf(view.sels)]);
+    return done();
+  }
+  const dir = ARROW[e.key];
+  if (dir) {
+    // macOS 的 ⌘←／⌘→ 是行首／行尾；⌘↑／⌘↓（Windows 的 Ctrl+Home／End）回到單一游標
+    let key = dir;
+    if (IS_MAC && e.metaKey && !e.altKey && !e.ctrlKey) {
+      if (dir === 'Left') key = 'Home';
+      else if (dir === 'Right') key = 'End';
+      else { view.exitMulti(); return false; }
+    } else if (!IS_MAC && e.ctrlKey && !e.altKey && (dir === 'Home' || dir === 'End' || dir === 'Up' || dir === 'Down')) { view.exitMulti(); return false; }
+    else if ((e.altKey && !IS_MAC) || (e.ctrlKey && IS_MAC) || (e.metaKey && e.altKey)) return false; // 交給快捷鍵（例如加游標、列選取）
+    view.setSels(C.moveSels(text, view.sels, key, { extend: e.shiftKey, word: wordKey && (key === 'Left' || key === 'Right'), metrics: view.metrics() }));
+    return done();
+  }
+  if (e.key === 'PageUp' || e.key === 'PageDown') { view.exitMulti(); return false; }
+  if (ta.readOnly) return false;
+  if (e.key === 'Backspace' || e.key === 'Delete') {
+    if (modKey) return false;
+    applyMulti(view, C.deleteAtSels(text, view.sels, e.key === 'Delete', wordKey));
+    return done();
+  }
+  if (e.key === 'Enter' && !modKey && !e.altKey) {
+    applyMulti(view, C.newlineAtSels(text, view.sels, indentUnit()));
+    return done();
+  }
+  if (e.key === 'Tab' && !modKey && !e.altKey) {
+    applyMulti(view, C.indentSels(text, view.sels, indentUnit(), e.shiftKey));
+    return done();
+  }
+  return false;
+}
+
+function bindMulti(view) {
+  const ta = view.ta;
+  // 打字：beforeinput 一次插入到所有游標（按鍵由 keydown 的 multiKey 處理）
+  ta.addEventListener('beforeinput', (e) => {
+    if (!view.sels || view.selfEdit || view.composing || e.isComposing) return;
+    if (!view.inSync()) { view.exitMulti(); return; }
+    if (e.inputType === 'insertText' && e.data !== null) {
+      e.preventDefault();
+      if (!ta.readOnly) applyMulti(view, C.insertAtSels(ta.value, view.sels, e.data));
+    } else if (e.inputType === 'insertLineBreak' || e.inputType.startsWith('delete')) {
+      e.preventDefault(); // 已由 keydown 處理（例如右鍵選單的刪除）
+    } else if (!e.inputType.startsWith('insertFromPaste')) {
+      view.exitMulti(); // ⌘Z、拖放…：交給 textarea 自己處理
+    }
+  });
+  // 中文輸入法：組字只在主要游標進行，選字完成後再插入到其他游標
+  ta.addEventListener('compositionstart', () => {
+    if (!view.sels) return;
+    if (!view.inSync()) { view.exitMulti(); return; }
+    view.composing = { text: ta.value, sels: view.sels, p: C.primaryOf(view.sels) };
+    view.carLayer.textContent = '';
+    view.selLayer.textContent = '';
+  });
+  ta.addEventListener('compositionend', (e) => {
+    const c = view.composing;
+    if (!c) return;
+    setTimeout(() => {
+      view.composing = null;
+      const data = e.data || '';
+      const pFrom = C.selFrom(c.p);
+      const pTo = C.selTo(c.p);
+      const expected = c.text.slice(0, pFrom) + data + c.text.slice(pTo);
+      if (ta.value !== expected || !data) { view.exitMulti(); return; }
+      const d = data.length - (pTo - pFrom);
+      const cur = c.sels.map((s) => {
+        if (s.p) return { a: pFrom + data.length, h: pFrom + data.length, p: true };
+        return C.selFrom(s) >= pTo ? { a: s.a + d, h: s.h + d } : { a: s.a, h: s.h };
+      });
+      view.sels = cur; // 讓 inSync 成立
+      const r = C.editSels(ta.value, cur, (t, from, to, i, s) => (s.p ? null : { from, to, insert: data }));
+      if (r) applyMulti(view, r); else view.setSels(cur);
+    }, 0);
+  });
+  // 複製、剪下：每個選取一行；貼上：行數和游標數相同時每個游標貼一行
+  ta.addEventListener('copy', (e) => {
+    if (!view.sels || !view.inSync()) return;
+    const parts = C.selectedTexts(ta.value, view.sels);
+    if (parts.every((p) => !p)) return;
+    e.preventDefault();
+    e.clipboardData.setData('text/plain', parts.join('\n'));
+  });
+  ta.addEventListener('cut', (e) => {
+    if (!view.sels || !view.inSync() || ta.readOnly) return;
+    const parts = C.selectedTexts(ta.value, view.sels);
+    if (parts.every((p) => !p)) return;
+    e.preventDefault();
+    e.clipboardData.setData('text/plain', parts.join('\n'));
+    applyMulti(view, C.insertAtSels(ta.value, view.sels, ''));
+  });
+  ta.addEventListener('paste', (e) => {
+    if (!view.sels || ta.readOnly) return;
+    if (!view.inSync()) { view.exitMulti(); return; }
+    const clip = (e.clipboardData.getData('text/plain') || '').replace(/\r\n?/g, '\n');
+    e.preventDefault();
+    const lines = clip.split('\n');
+    const n = view.sels.length;
+    const parts = lines.length === n ? lines : lines.length === n + 1 && lines[n] === '' ? lines.slice(0, n) : clip;
+    applyMulti(view, C.insertAtSels(ta.value, view.sels, parts));
+  });
+  ta.addEventListener('mousedown', (e) => onEditorMouseDown(e, view));
+  ta.addEventListener('blur', () => view.carLayer.classList.add('idle'));
+  ta.addEventListener('focus', () => view.carLayer.classList.remove('idle'));
+}
+
+/**
+ * 滑鼠：
+ * - ⌥＋點擊：加一個游標（點在已有的游標上則移除）
+ * - ⌥＋拖曳、⇧⌥＋拖曳，或「列選取模式」下直接拖曳：矩形選取（自動換行時不支援）
+ * - 一般點擊：回到單一游標
+ */
+function onEditorMouseDown(e, view) {
+  if (e.button !== 0) return;
+  const ta = view.ta;
+  const column = e.altKey || (st.colMode && !e.shiftKey && !mod(e));
+  if (!column) { if (!mod(e)) view.exitMulti(); return; }
+  const start = view.pointAt(e);
+  if (!start) {
+    // 自動換行時：讓 textarea 放好原生游標，再把它加進多游標
+    if (!e.altKey) return;
+    const before = view.allSels();
+    setTimeout(() => {
+      const n = view.nativeSel();
+      if (n.a !== n.h) return;
+      addOrRemoveCaret(view, before, n.h);
+    }, 0);
+    return;
+  }
+  e.preventDefault();
+  ta.focus({ preventScroll: true });
+  const before = view.allSels();
+  const startPos = view.posAt(start);
+  let moved = false;
+  const onMove = (ev) => {
+    const pt = view.pointAt(ev);
+    if (!pt) return;
+    if (!moved && pt.line === start.line && Math.abs(pt.x - start.x) < 4) return;
+    moved = true;
+    view.colBox = { aLine: start.line, aX: start.x, hLine: pt.line, hX: pt.x };
+    view.setSels(C.columnSels(ta.value, start.line, start.x, pt.line, pt.x, view.metrics()), { reveal: false, keepBox: true });
+    autoScroll(view, ev);
+  };
+  const onUp = () => {
+    removeEventListener('mousemove', onMove);
+    removeEventListener('mouseup', onUp);
+    if (moved) return;
+    if (e.altKey) addOrRemoveCaret(view, before, startPos);
+    else view.setSels([{ a: startPos, h: startPos, p: true }]);
+  };
+  addEventListener('mousemove', onMove);
+  addEventListener('mouseup', onUp);
+}
+
+function addOrRemoveCaret(view, before, pos) {
+  const hit = before.find((s) => s.a === s.h && s.h === pos);
+  if (hit && before.length > 1) {
+    const rest = before.filter((s) => s !== hit).map(({ p, ...s }) => s);
+    rest[rest.length - 1].p = true;
+    view.setSels(rest, { reveal: false });
+  } else {
+    view.setSels([...before.map(({ p, ...s }) => s), { a: pos, h: pos, p: true }], { reveal: false });
+  }
+}
+
+/** 拖曳到邊緣時捲動 */
+function autoScroll(view, ev) {
+  const r = view.el.getBoundingClientRect();
+  if (ev.clientY < r.top + 20) view.el.scrollTop -= 20;
+  else if (ev.clientY > r.bottom - 20) view.el.scrollTop += 20;
+  if (ev.clientX > r.right - 20) view.el.scrollLeft += 20;
+  else if (ev.clientX < r.left + 20) view.el.scrollLeft -= 20;
+}
+
+/** 編輯中的程式碼分頁（游標在編輯器裡） */
+function editingView() {
+  const t = codeTab();
+  if (!t) return null;
+  if (t.view.sels && !t.view.inSync()) t.view.exitMulti();
+  return t.view;
+}
+
+const wordAtFor = (view) => (text, pos) => { const w = C.wordAt(text, pos, view.tab.lang); return w && { start: w.start, end: w.end }; };
+
+/** ⌘D：選取游標所在的字，再按一次加入下一個相同的文字 */
+function addNextOccurrence() {
+  const v = editingView();
+  if (!v) return;
+  const r = C.nextOccurrence(v.ta.value, v.allSels(), { word: !!v.wholeWord, wordAt: wordAtFor(v) });
+  if (!r) { notice(v.sels ? '沒有更多相同的文字' : '游標不在名稱上'); return; }
+  v.setSels(r.sels);
+  v.wholeWord = r.word;
+}
+
+/** 選取所有相同的文字（或游標所在的字） */
+function selectAllOccurrences() {
+  const v = editingView();
+  if (!v) return;
+  const sels = C.allOccurrences(v.ta.value, v.allSels(), { word: !!v.wholeWord, wordAt: wordAtFor(v) });
+  if (!sels) { notice('游標不在名稱上'); return; }
+  v.setSels(sels);
+  notice(`已選取 ${sels.length.toLocaleString()} 個相同的文字`);
+}
+
+/** 在上一行／下一行加游標 */
+function addCursorVertical(dir) {
+  const v = editingView();
+  if (!v) return;
+  if (v.large) { notice('大型檔案不支援多游標'); return; }
+  const sels = C.addCaretVertical(v.ta.value, v.allSels(), dir, v.metrics());
+  if (sels) v.setSels(sels);
+}
+
+/** 選取範圍涵蓋的每一行行尾各放一個游標（多行選取後在每行後面加文字） */
+function cursorsToLineEnds() {
+  const v = editingView();
+  if (!v) return;
+  const text = v.ta.value;
+  const out = [];
+  for (const s of v.allSels()) {
+    const from = C.selFrom(s);
+    const to = C.selTo(s);
+    if (from === to) { out.push({ a: from, h: from }); continue; }
+    const first = v.lineOf(from);
+    const last = v.lineOf(to > from && text[to - 1] === '\n' ? to - 1 : to);
+    for (let line = first; line <= last; line++) {
+      const [, end] = C.lineBounds(text, line);
+      out.push({ a: end, h: end });
+    }
+  }
+  if (out.length) out[out.length - 1].p = true;
+  v.setSels(out);
+}
+
+/** 鍵盤延伸列選取：從主要游標開始，往 dir 方向擴大矩形 */
+function columnSelect(dir) {
+  const v = editingView();
+  if (!v) return;
+  if (v.large) { notice('大型檔案不支援列選取'); return; }
+  if (v.el.classList.contains('wrap')) { notice('自動換行時無法列選取（⌥Z 切換）'); return; }
+  const text = v.ta.value;
+  const m = v.metrics();
+  const starts = v.lineStarts();
+  const lineText = (n) => text.slice(starts[n], n + 1 < starts.length ? starts[n + 1] - 1 : text.length);
+  if (!v.colBox) {
+    const p = C.primaryOf(v.allSels());
+    const al = v.lineOf(p.a);
+    const hl = v.lineOf(p.h);
+    v.colBox = { aLine: al, aX: m.colOf(lineText(al), p.a - starts[al]), hLine: hl, hX: m.colOf(lineText(hl), p.h - starts[hl]) };
+  }
+  const b = { ...v.colBox };
+  if (dir === 'Up') b.hLine = Math.max(0, b.hLine - 1);
+  else if (dir === 'Down') b.hLine = Math.min(starts.length - 1, b.hLine + 1);
+  else {
+    const line = lineText(b.hLine);
+    const at = m.offAt(line, b.hX);
+    const spaceW = m.colOf(' ', 1);
+    if (dir === 'Left') b.hX = at.past ? Math.max(0, b.hX - spaceW) : Math.max(0, m.colOf(line, Math.max(0, at.off - 1)));
+    else b.hX = at.off >= line.length ? b.hX + spaceW : m.colOf(line, at.off + 1);
+  }
+  v.colBox = b;
+  v.setSels(C.columnSels(text, b.aLine, b.aX, b.hLine, b.hX, m), { keepBox: true });
+}
+
+function toggleColumnMode(on = !st.colMode, { quiet = false } = {}) {
+  st.colMode = on;
+  store.set('colMode', on);
+  $('#stCol').classList.toggle('on', on);
+  $('#stCol').title = on ? '列選取模式：開（拖曳選取矩形範圍，⇧＋方向鍵延伸）。點一下關閉' : '列選取模式：關（⌥＋拖曳仍可選取矩形範圍）。點一下開啟';
+  document.body.classList.toggle('col-mode', on);
+  if (!quiet) notice(on ? '列選取模式：拖曳滑鼠選取矩形範圍，⇧＋方向鍵延伸' : '已關閉列選取模式');
+}
+
+/** 每個游標插入遞增的數字（列編輯） */
+async function insertSequence() {
+  const v = editingView();
+  if (!v || v.ta.readOnly) return;
+  const n = v.allSels().length;
+  const input = await ask(`插入數字序列（${n} 個游標）`, store.get('seqSpec', '1, 1'), { hint: '起始值, 間隔[, 位數]，例如「1, 1」、「10, 10」、「1, 1, 3」→ 001、002…' });
+  if (input === null) return;
+  const [start, step = 1, pad = 0] = input.split(/[,，\s]+/).filter(Boolean).map(Number);
+  if (![start, step, pad].every(Number.isFinite)) { notice('請輸入數字，例如「1, 1」'); return; }
+  store.set('seqSpec', input);
+  v.focus();
+  if (v.sels && !v.inSync()) v.exitMulti();
+  applyMulti(v, C.sequenceAtSels(v.ta.value, v.allSels(), { start, step, pad: Math.max(0, Math.min(20, pad)) }));
+}
+
+/** 尋找列：選取所有符合的項目，變成多游標 */
+function selectAllFindMatches() {
+  const t = codeTab();
+  if (!t) return;
+  const ms = allMatches(t.view.text, findRegex(), 10000);
+  if (!ms.length) { refreshFind(); return; }
+  const sels = ms.map(([a, h]) => ({ a, h }));
+  sels[0].p = true;
+  closeFind();
+  t.view.setSels(sels);
+  notice(`已選取 ${ms.length.toLocaleString()} 個符合的項目`);
+}
+
+/* ───────────── 分享檔案（資料交換） ───────────── */
+
+const SHARE_MAX = 9.5 * 1024 * 1024; // 交換包上限 10 MB（docs/EXCHANGE.md〈4〉），留一點給信封
+const canShare = (name) => !!td.exchange && C.shareKinds(name).length > 0;
+
+/** 要分享的內容：已開啟的分頁用編輯器裡的文字（含未儲存的修改），否則讀檔 */
+async function shareSource(file) {
+  const t = st.tabs.find((x) => x.kind === 'file' && x.file === file && !x.unavailable);
+  if (t) return { text: t.view.text, dirty: isDirty(t) };
+  const doc = await td.invoke('read', file);
+  if (doc.binary || doc.tooLarge) throw new Error(`${doc.name || basename(file)} ${doc.binary ? '是二進位檔案' : '太大'}，無法分享`);
+  return { text: doc.text, dirty: false };
+}
+
+/** 依副檔名建立交換包的內容：{ type, payload, label }；不能轉成表格時只有文字 */
+function shareChoices(name, text) {
+  const out = [];
+  for (const k of C.shareKinds(name)) {
+    if (k.kind === 'table') {
+      try {
+        const ext = name.split('.').pop().toLowerCase();
+        const payload = ext === 'json' ? C.jsonToTable(JSON.parse(text)) : C.csvToTable(text, ext === 'tsv' ? '\t' : undefined);
+        if (payload) out.push({ type: 'tooldock.table', payload, label: `分享為表格（${payload.columns.length} 欄、${payload.rows.length.toLocaleString()} 列）` });
+      } catch (err) {
+        if (name.toLowerCase().endsWith('.json')) throw new Error(`JSON 格式錯誤，無法分享：${err.message}`);
+      }
+    } else {
+      out.push({ type: 'tooldock.text', mime: k.mime, payload: { mime: k.mime, text, filename: name }, label: k.mime === 'text/markdown' ? '分享 Markdown' : `分享為文字（${k.mime}）` });
+    }
+  }
+  return out;
+}
+
+/**
+ * 分享 Markdown／CSV／JSON 給其他工具：Markdown 是文字（例如交給 Markdown 編輯器）；
+ * CSV／JSON 可以分享成表格（報表產生器、資料轉換）或原始文字。有兩種方式時先讓使用者選。
+ * at：選單出現的位置（滑鼠事件）；沒有時顯示在畫面上方中間。
+ */
+async function shareFile(file, at) {
+  if (!td.exchange) { notice('這個版本的 ToolDock 不支援資料交換，請更新到 1.4.0 以上', 'err'); return; }
+  if (!file) { notice('請先儲存檔案再分享'); return; }
+  const name = basename(file);
+  if (!C.shareKinds(name).length) { notice('只能分享 Markdown、CSV、JSON 檔案', 'err'); return; }
+  const src = await shareSource(file);
+  if (src.text.length > SHARE_MAX) { notice(`${name} 超過 10 MB，無法分享`, 'err'); return; }
+  const choices = shareChoices(name, src.text);
+  if (!choices.length) { notice(`${name} 沒有可以分享的內容`, 'err'); return; }
+  const go = async (c) => {
+    const rel = relOf(file);
+    const pkg = await td.exchange.create(c.type, c.payload, { title: name, description: rel || file });
+    const r = await td.exchange.share(pkg);
+    if (r.status === 'delivered') {
+      if (r.result && r.result.status === 'rejected') throw new Error(r.result.message || `${r.receiver ? r.receiver.name : '對方'}無法接收`);
+      notice(`已交給${r.receiver ? `「${r.receiver.name}」` : '其他工具'}${src.dirty ? '（含未儲存的修改）' : ''}`);
+    } else if (r.status === 'exported') notice(`已存成交換檔：${r.filePath}`);
+    else if (r.status === 'no-receiver') notice('沒有可以接收的工具', 'err');
+    else if (r.status === 'error') throw new Error(r.message || '分享失敗');
+  };
+  if (choices.length === 1) { await go(choices[0]); return; }
+  // 兩種方式：標出會交給誰
+  const items = [];
+  for (const c of choices) {
+    const rs = await td.exchange.receivers(c.type, 1, c.mime ? { mime: c.mime } : undefined).catch(() => []);
+    const who = rs.length ? `：${rs.map((x) => x.name).join('、')}` : '：存成交換檔';
+    items.push([`${c.label}${who}`, () => go(c)]);
+  }
+  const pos = at && at.clientX !== undefined ? at : { clientX: innerWidth / 2 - 140, clientY: 60 };
+  contextMenu({ clientX: pos.clientX, clientY: pos.clientY, preventDefault() {} }, items);
 }
 
 /** 套用 code-core 的編輯：用 execCommand('insertText') 讓 ⌘Z 可以復原 */
 function applyEdit(view, e) {
   if (!e) return false;
+  view.exitMulti();
   const ta = view.ta;
   ta.focus({ preventScroll: true });
   ta.setSelectionRange(e.from, e.to);
@@ -363,6 +1000,14 @@ function onEditorKey(e, view) {
   if (e.isComposing || e.keyCode === 229) return;
   const ta = view.ta;
   const mod = IS_MAC ? e.metaKey : e.ctrlKey;
+  // 列選取模式：⇧＋方向鍵延伸矩形
+  if (st.colMode && e.shiftKey && !e.altKey && !mod && !e.ctrlKey && /^Arrow/.test(e.key)) {
+    e.preventDefault();
+    columnSelect(ARROW[e.key]);
+    return;
+  }
+  if (view.sels && !view.inSync()) view.exitMulti();
+  if (view.sels && multiKey(e, view)) return;
   if (ta.readOnly && !mod) return;
   if (e.key === 'Tab' && !mod && !e.altKey) {
     e.preventDefault();
@@ -599,7 +1244,7 @@ function updateStatusBar() {
   const isFile = t && t.kind === 'file' && !t.unavailable;
   $('#stPath').textContent = t ? (t.file ? (relOf(t.file) ?? t.file) : t.name) : '';
   $('#stPath').title = t && t.file ? t.file : '';
-  for (const id of ['#stWrap', '#stIndent', '#stEol', '#stLang']) $(id).hidden = !isFile;
+  for (const id of ['#stWrap', '#stCol', '#stIndent', '#stEol', '#stLang']) $(id).hidden = !isFile;
   $('#stEnc').textContent = !isFile ? '' : t.decompiled ? (t.decompiled === 'cfr' ? '反編譯（唯讀）' : '類別結構（唯讀）')
     : t.encoding === 'utf8' ? (t.bom ? 'UTF-8 BOM' : 'UTF-8') : `${t.encoding.toUpperCase()}（唯讀）`;
   if (!isFile) { $('#stPos').textContent = ''; return; }
@@ -882,6 +1527,7 @@ function onTreeContext(e) {
   if (row) { st.tree.sel = rel; markTreeSel(); }
   const items = [];
   if (row && !isDir) items.push(['開啟', () => openFile(absOf(rel))]);
+  if (row && !isDir && canShare(rel)) items.push(['分享給其他工具…', () => shareFile(absOf(rel), e)]);
   if (row && !isDir && st.gitMap.has(rel)) items.push(['查看 Git 差異', () => openDiffForRel(rel)]);
   if (row && !isDir && st.git && st.git.repo && !isUntracked(rel)) items.push(['檔案歷史', () => openHistory(absOf(rel))]);
   const rv = row && !isDir ? restorableEntry(rel) : null;
@@ -2547,6 +3193,18 @@ const KEY_COMMANDS = [
   { id: 'navForward', group: '前往', title: '前往下一個位置', mac: ['Ctrl+Shift+-'], win: ['Alt+Right'], run: () => navGo(1) },
   { id: 'toggleComment', group: '編輯', title: '切換行註解', mac: ['Mod+/'], win: ['Mod+/'], editor: true, run: () => toggleCommentAtCaret() },
   { id: 'wordWrap', group: '編輯', title: '切換自動換行', mac: ['Alt+Z'], win: ['Alt+Z'], run: () => td.settings.update('codeEditor.wordWrap', !setting('wordWrap', false)) },
+  { id: 'addNextOccurrence', group: '多游標與列編輯', title: '選取字／加入下一個相同的文字', mac: ['Mod+D'], win: ['Mod+D'], editor: true, run: () => addNextOccurrence() },
+  { id: 'selectAllOccurrences', group: '多游標與列編輯', title: '選取所有相同的文字', mac: ['Mod+F2'], win: ['Mod+F2'], editor: true, run: () => selectAllOccurrences() },
+  { id: 'addCursorAbove', group: '多游標與列編輯', title: '在上一行加游標', mac: ['Mod+Alt+Up'], win: ['Mod+Alt+Up'], editor: true, run: () => addCursorVertical(-1) },
+  { id: 'addCursorBelow', group: '多游標與列編輯', title: '在下一行加游標', mac: ['Mod+Alt+Down'], win: ['Mod+Alt+Down'], editor: true, run: () => addCursorVertical(1) },
+  { id: 'cursorsToLineEnds', group: '多游標與列編輯', title: '在選取的每一行行尾加游標', mac: ['Alt+Shift+I'], win: ['Alt+Shift+I'], editor: true, run: () => cursorsToLineEnds() },
+  { id: 'columnUp', group: '多游標與列編輯', title: '列選取：往上延伸', mac: ['Mod+Alt+Shift+Up'], win: ['Mod+Alt+Shift+Up'], editor: true, run: () => columnSelect('Up') },
+  { id: 'columnDown', group: '多游標與列編輯', title: '列選取：往下延伸', mac: ['Mod+Alt+Shift+Down'], win: ['Mod+Alt+Shift+Down'], editor: true, run: () => columnSelect('Down') },
+  { id: 'columnLeft', group: '多游標與列編輯', title: '列選取：往左延伸', mac: ['Mod+Alt+Shift+Left'], win: ['Mod+Alt+Shift+Left'], editor: true, run: () => columnSelect('Left') },
+  { id: 'columnRight', group: '多游標與列編輯', title: '列選取：往右延伸', mac: ['Mod+Alt+Shift+Right'], win: ['Mod+Alt+Shift+Right'], editor: true, run: () => columnSelect('Right') },
+  { id: 'columnMode', group: '多游標與列編輯', title: '切換列選取模式', mac: [], win: [], run: () => toggleColumnMode() },
+  { id: 'insertSequence', group: '多游標與列編輯', title: '在每個游標插入數字序列…', mac: [], win: [], editor: true, run: () => insertSequence() },
+  { id: 'shareFile', group: '其他', title: '分享目前檔案給其他工具（Markdown、CSV、JSON）', mac: [], win: [], run: () => { const t = codeTab(); return t ? shareFile(t.file) : notice('請先開啟檔案'); } },
   { id: 'openTerminal', group: '其他', title: '在終端機開啟專案', mac: ['Mod+Shift+C'], win: ['Mod+Shift+C'], run: () => openTerminalAt('') },
   { id: 'keybindings', group: '其他', title: '鍵盤快捷鍵', mac: ['Mod+K'], win: ['Mod+K'], run: () => openKeysPanel() },
 ];
@@ -2557,7 +3215,10 @@ const FIXED_KEYS = [
   ['Tab／Shift+Tab', '縮排／取消縮排（有選取多行時整段）'],
   ['Enter', '換行並延續縮排'],
   [`${IS_MAC ? '⌘' : 'Ctrl'}＋點擊名稱`, '跳到定義'],
-  ['Esc', '關閉尋找列、選單、定義清單'],
+  ['Esc', '取消多游標；關閉尋找列、選單、定義清單'],
+  [`${IS_MAC ? '⌥' : 'Alt+'}點擊`, '加一個游標（點在游標上則移除）'],
+  [`${IS_MAC ? '⌥' : 'Alt+'}拖曳`, '列選取（矩形範圍），每一行一個游標'],
+  [`${IS_MAC ? '⌥' : 'Alt+'}Enter`, '尋找列：選取所有符合的項目（變成多游標）'],
   ['Enter／Shift+Enter', '尋找列：下一個／上一個'],
   [`Enter／${IS_MAC ? '⌘' : 'Ctrl'}+Enter`, '尋找列的取代框：取代一個／全部取代'],
   ['↑↓、Enter、空白鍵、Delete', '專案搜尋結果：瀏覽、開啟、勾選、從清單移除'],
@@ -2834,6 +3495,7 @@ function selDir() {
 }
 
 const ACTIONS = {
+  shareFile: () => { const t = codeTab(); return t ? shareFile(t.file) : notice('請先開啟 Markdown、CSV 或 JSON 檔案'); },
   addProject: () => addProject(),
   renameProject: () => renameProject(),
   removeProject: () => removeProject(),
@@ -2858,6 +3520,7 @@ async function runCommand(cmd) {
   else if (cmd === 'search') openSearch(false);
   else if (cmd === 'keybindings') openKeysPanel();
   else if (cmd === 'openTerminal') await openTerminalAt('');
+  else if (cmd === 'shareFile') { const t = codeTab(); if (t) await shareFile(t.file); else notice('請先開啟 Markdown、CSV 或 JSON 檔案'); }
 }
 
 async function drainPending() {
@@ -3019,6 +3682,7 @@ function bind() {
       if (rv) items.push([rv.area === 'untracked' ? '刪除未追蹤的檔案…' : '還原 Git 變更…', () => restoreEntries([rv])]);
     }
     if (t.kind === 'file' && !t.unavailable) items.push('-', ['另存新檔…', () => save(t, true)]);
+    if (t.kind === 'file' && !t.unavailable && t.file && canShare(t.name)) items.push(['分享給其他工具…', () => shareFile(t.file, e)]);
     contextMenu(e, items);
   });
 
@@ -3031,7 +3695,11 @@ function bind() {
     ta.setSelectionRange(ta.selectionStart, ta.selectionStart);
     findStep(1);
   });
-  $('#findInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); findStep(e.shiftKey ? -1 : 1); } });
+  $('#findInput').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    if (e.altKey) selectAllFindMatches(); else findStep(e.shiftKey ? -1 : 1);
+  });
   $('#replaceInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); if (mod(e)) replaceAll(); else replaceOne(); } });
   $('#findNext').onclick = () => findStep(1);
   $('#findPrev').onclick = () => findStep(-1);
@@ -3056,6 +3724,7 @@ function bind() {
   $('#stWrap').onclick = () => td.settings.update('codeEditor.wordWrap', !setting('wordWrap', false)).catch(fail);
   $('#stIndent').onclick = () => td.settings.update('codeEditor.insertSpaces', !setting('insertSpaces', true)).catch(fail);
   $('#stKeys').onclick = () => openKeysPanel();
+  $('#stCol').onclick = () => toggleColumnMode();
 
   addEventListener('focus', onWindowFocus);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) onWindowFocus(); });
@@ -3072,6 +3741,7 @@ const mod = (e) => (IS_MAC ? e.metaKey : e.ctrlKey);
 
 async function init() {
   st.diffMode = store.get('diffMode', 'sbs');
+  toggleColumnMode(!!store.get('colMode', false), { quiet: true });
   initSplitter();
   bind();
   bindSearch();

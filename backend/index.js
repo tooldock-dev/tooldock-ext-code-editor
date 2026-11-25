@@ -273,6 +273,7 @@ exports.activate = (context) => {
   ctx.subscriptions.push(
     ctx.commands.register('codeEditor.open', () => ctx.window.openView('codeEditor.main')),
     ctx.commands.register('codeEditor.addProject', () => toView('addProject')),
+    ctx.commands.register('codeEditor.shareFile', () => toView('shareFile')),
     ctx.commands.register('codeEditor.openFile', () => toView('openFile')),
     ctx.commands.register('codeEditor.showChanges', () => toView('showChanges')),
     ctx.commands.register('codeEditor.search', () => toView('search')),
