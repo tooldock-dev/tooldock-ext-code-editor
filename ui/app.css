@@ -384,3 +384,17 @@ body.mod-down .code textarea { cursor: pointer; }
 kbd { display: inline-block; min-width: 18px; padding: 1px 6px; border: 1px solid var(--border-strong); border-bottom-width: 2px; border-radius: 4px; background: var(--bg); color: var(--fg-strong); font-family: var(--font); font-size: 12px; line-height: 1.4; text-align: center; white-space: nowrap; }
 .krec { color: var(--accent); font-size: 12px; }
 .knone { color: var(--fg-faint); font-size: 12px; }
+
+/* 載入中遮罩：一出現就擋住操作，稍等一下才顯示卡片，快的時候不會閃 */
+#busy { position: fixed; inset: 0; z-index: 60; display: none; align-items: center; justify-content: center; cursor: progress; }
+#busy.on { display: flex; }
+#busy.on { animation: busy-dim .2s .15s both; }
+#busy .card { display: flex; align-items: center; gap: 12px; min-width: 240px; max-width: min(520px, 86vw); padding: 14px 18px; background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .3); animation: busy-in .2s .15s both; }
+#busy .t { color: var(--fg-strong); font-size: 13px; }
+#busy .d { margin-top: 2px; color: var(--fg-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#busy .d:empty { display: none; }
+#busy .spinner { flex: none; width: 18px; height: 18px; border: 2px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: busy-spin .8s linear infinite; }
+@keyframes busy-dim { from { background: transparent; } to { background: rgba(0, 0, 0, .25); } }
+@keyframes busy-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes busy-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { #busy .spinner { animation-duration: 2s; } }

@@ -66,6 +66,57 @@ function notice(msg, kind = '') {
 }
 const fail = (err) => notice(err && err.message ? err.message : String(err), 'err');
 
+/* ───────────── 載入中 ───────────── */
+// 啟動、切換專案、重新整理時蓋住畫面並擋下鍵盤，讀取完成前不能操作，避免狀態錯亂。
+// 可以巢狀（例如啟動時順便載入上次的專案），全部離開才收起；離開時還原外層的說明文字。
+const busy = {
+  depth: 1, // index.html 的 #busy 預設就是開著的：初始化完成前都算忙碌中
+  stack: [['正在啟動程式碼編輯器…', '']],
+  enter(title, detail = '') {
+    if (!this.depth) {
+      const a = document.activeElement;
+      if (a && a !== document.body) a.blur();
+      $('#busy').classList.add('on');
+    }
+    this.depth++;
+    this.stack.push([title, detail]);
+    this.show();
+  },
+  /** 更新目前這一層的進度說明 */
+  step(detail) {
+    const top = this.stack[this.stack.length - 1];
+    if (top) { top[1] = detail || ''; this.show(); }
+  },
+  leave() {
+    if (!this.depth) return;
+    this.depth--;
+    this.stack.pop();
+    if (this.depth) { this.show(); return; }
+    $('#busy').classList.remove('on');
+    const t = codeTab();
+    if (t && (!document.activeElement || document.activeElement === document.body)) t.view.focus();
+  },
+  show() {
+    const [title, detail] = this.stack[this.stack.length - 1] || ['', ''];
+    const b = $('#busy');
+    $('.t', b).textContent = title;
+    $('.d', b).textContent = detail;
+  },
+};
+async function withBusy(title, fn) {
+  busy.enter(title);
+  try { return await fn(); } finally { busy.leave(); }
+}
+// 忙碌中不接受鍵盤（遮罩已經擋住滑鼠）；用 capture 搶在編輯區與快捷鍵之前
+document.addEventListener('keydown', (e) => {
+  if (!busy.depth) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}, true);
+/** 初始化完成（專案、設定都讀好了）；其他工具送來的指令要等這個才執行 */
+let markReady;
+const ready = new Promise((r) => { markReady = r; });
+
 function banner(msg, actions = []) {
   const b = $('#banner');
   if (!msg) { b.hidden = true; return; }
@@ -1286,8 +1337,16 @@ async function addProject() {
   await switchProject(res.project.id);
 }
 
-async function switchProject(id, state) {
-  if (id === st.pid && !state) return;
+/** 切換專案：一次只跑一個，連續切換會排隊依序處理，不會兩個專案的資料混在一起 */
+let switchChain = Promise.resolve();
+function switchProject(id, state) {
+  const run = switchChain.then(() => doSwitchProject(id, state));
+  switchChain = run.catch(() => { /* 錯誤交給呼叫端 */ });
+  return run;
+}
+
+async function doSwitchProject(id, state) {
+  if (id === st.pid && !state) { renderProjects(); return; }
   if (st.tabs.some(isDirty)) {
     const r = await td.dialog.message({
       type: 'warning', message: '切換專案會關閉目前的分頁，要先儲存變更嗎？',
@@ -1296,7 +1355,14 @@ async function switchProject(id, state) {
     if (r.response === 2) { renderProjects(); return; }
     if (r.response === 0) for (const t of st.tabs.filter(isDirty)) if (!(await save(t))) { renderProjects(); return; }
   }
+  const target = id && st.projects.find((p) => p.id === id);
+  await withBusy(target ? `正在載入專案「${target.name}」…` : '正在關閉專案…', () => loadProject(id, state));
+}
+
+async function loadProject(id, state) {
+  busy.step('儲存目前的狀態');
   await saveState();
+  busy.step('關閉分頁');
   for (const t of [...st.tabs]) await closeTab(t.id, true);
   st.pid = id || null;
   st.tree = { kids: new Map(), expanded: new Set(), sel: '' };
@@ -1315,11 +1381,14 @@ async function switchProject(id, state) {
   if (!st.pid) { renderTree(); renderGit(); return; }
   if (s && Array.isArray(s.expanded)) for (const r of s.expanded) st.tree.expanded.add(r);
   if (s && s.side) setSide(s.side);
+  busy.step('讀取檔案樹');
   await loadTree();
   refreshGit();
   // 還原上次開著的檔案
   if (s && Array.isArray(s.tabs)) {
+    let n = 0;
     for (const rel of s.tabs) {
+      busy.step(`開啟上次的檔案（${++n}/${s.tabs.length}）：${basename(rel)}`);
       try { await openFile(absOf(rel)); } catch { /* 檔案已不存在 */ }
     }
     const a = s.active && st.tabs.find((t) => t.file === absOf(s.active));
@@ -1597,9 +1666,14 @@ async function renameEntry(rel) {
 }
 
 async function refreshAll() {
-  st.fileList = null;
-  await loadTree();
-  await refreshGit();
+  if (!st.pid) return;
+  await withBusy('正在重新整理專案…', async () => {
+    st.fileList = null;
+    busy.step('讀取檔案樹');
+    await loadTree();
+    busy.step('讀取 Git 狀態');
+    await refreshGit();
+  });
   for (const t of st.tabs) checkExternal(t);
 }
 
@@ -3524,13 +3598,14 @@ async function runCommand(cmd) {
 }
 
 async function drainPending() {
+  await ready; // 啟動中收到的指令（例如 Git 工具要求開啟專案）等初始化完成再處理
   const c = await td.invoke('takePending');
   if (c) await runCommand(c);
 }
 
 let focusTimer = 0;
 function onWindowFocus() {
-  if (Date.now() - focusTimer < 1500) return;
+  if (busy.depth || Date.now() - focusTimer < 1500) return;
   focusTimer = Date.now();
   const t = activeTab();
   if (t) checkExternal(t);
@@ -3740,6 +3815,16 @@ function bind() {
 const mod = (e) => (IS_MAC ? e.metaKey : e.ctrlKey);
 
 async function init() {
+  try {
+    await setup();
+  } finally {
+    busy.leave(); // 收起 index.html 預設開著的「正在啟動」
+    markReady();
+  }
+  await drainPending();
+}
+
+async function setup() {
   st.diffMode = store.get('diffMode', 'sbs');
   toggleColumnMode(!!store.get('colMode', false), { quiet: true });
   initSplitter();
@@ -3748,6 +3833,7 @@ async function init() {
   bindDefinitions();
   bindKeysPanel();
   loadSearchPrefs();
+  busy.step('讀取設定與專案清單');
   st.info = await td.invoke('info');
   loadKeymap(st.info.keybindings);
   st.projects = st.info.projects;
@@ -3760,7 +3846,6 @@ async function init() {
   renderTabs();
   updateStatusBar();
   refreshTargets();
-  await drainPending();
 }
 
 init().catch((err) => { console.error(err); fail(err); });
